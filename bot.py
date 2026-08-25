@@ -4,20 +4,23 @@ import discord
 from discord.ext import commands
 from discord.ui import View, Select, Button
 
-# --- RÉCUPÉRATION DES SECRETS DE L'HÉBERGEUR ---
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_LOG_CHANNEL_ID = int(os.getenv("ADMIN_LOG_CHANNEL_ID", 0))
 
-# Configuration des salons fixes et capacités
-PRESET_ROOMS_CONFIG = {
-    "point-d-eau": 3,
-    "foret": 3,
-    "plage": 4,
-    "riviere": 5
+TEAMS_CONFIG = {
+    "Rouge": {
+        "color": discord.Color.red(),
+        "rooms": {"point-d-eau-rouge": 3, "foret-rouge": 3, "plage-rouge": 4, "riviere-rouge": 5}
+    },
+    "Jaune": {
+        "color": discord.Color.yellow(),
+        "rooms": {"point-d-eau-jaune": 3, "foret-jaune": 3, "plage-jaune": 4, "riviere-jaune": 5}
+    }
 }
 
+# {channel_id: {"name": str, "team": str, "capacity": int, "members": [user_ids]}}
 rooms_data = {}
-dashboard_message = None
+dashboard_messages = {}  # {"Équipe Rouge": message, "Équipe Bleue": message}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -26,75 +29,93 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def archive_and_purge(channel, guild, reason_text):
+    """Archive les messages utilisateur vers le salon admin et vide le salon."""
     admin_channel = guild.get_channel(ADMIN_LOG_CHANNEL_ID)
     messages = [msg async for msg in channel.history(limit=200, oldest_first=True)]
     user_messages = [msg for msg in messages if not msg.author.bot]
-    
+
     if user_messages and admin_channel:
         log_text = f"=== ARCHIVE : {channel.name} ===\nÉvénement : {reason_text}\n\n"
         for msg in user_messages:
             log_text += f"[{msg.created_at.strftime('%H:%M:%S')}] {msg.author.name} : {msg.content}\n"
-        
+
         file = discord.File(
-            fp=io.BytesIO(log_text.encode('utf-8')), 
+            fp=io.BytesIO(log_text.encode('utf-8')),
             filename=f"log_{channel.name}.txt"
         )
         await admin_channel.send(content=f"📁 **Archive de {channel.mention}** (`{reason_text}`)", file=file)
-    
+
     await channel.purge(limit=200)
 
 
 async def send_room_control_panel(channel, guild):
+    """Envoie l'encadré d'accueil et le bouton de sortie dans le salon secret."""
     room_data = rooms_data.get(channel.id)
     if not room_data:
         return
-        
+
     members_mentions = [guild.get_member(m_id).mention for m_id in room_data["members"] if guild.get_member(m_id)]
     occupants_str = ", ".join(members_mentions) if members_mentions else "Personne"
 
     embed = discord.Embed(
-        title=f"📍 Lieu : {room_data['name'].capitalize()}",
+        title=f"📍 Lieu : {room_data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()}",
         description=(
+            f"**Équipe :** {room_data['team']}\n"
             f"**Présents :** {occupants_str}\n"
             f"**Capacité :** {len(room_data['members'])}/{room_data['capacity']}\n\n"
-            "💬 Messages archivés et purgés à chaque mouvement.\n"
-            "Pour partir : cliquez ci-dessous ou tapez `!quitter`."
+            "💬 Les messages sont effacés dès qu'un membre entre ou sort.\n"
+            "Pour partir : cliquez sur le bouton ci-dessous ou tapez `!quitter`."
         ),
-        color=discord.Color.dark_green()
+        color=TEAMS_CONFIG[room_data['team']]['color']
     )
     await channel.send(embed=embed, view=InsideRoomView())
 
 
-def generate_dashboard_embed(guild):
+def generate_dashboard_embed(guild, team_name):
+    """Génère l'embed pour une équipe donnée."""
+    team_info = TEAMS_CONFIG[team_name]
     embed = discord.Embed(
-        title="🗺️ Carte des Lieux de Rencontre", 
-        description="Choisissez un lieu dans le menu ci-dessous.\n⚠️ *Tout s'efface quand quelqu'un entre ou sort !*", 
-        color=discord.Color.teal()
+        title=f"🗺️ Carte des Lieux — {team_name}",
+        description=(
+            "Sélectionnez un lieu ci-dessous pour vous y déplacer.\n"
+            "Si vous êtes déjà dans une pièce, vous changerez automatiquement d'endroit.\n"
+            "⚠️ *L'historique est effacé et envoyé aux admins à chaque mouvement.*"
+        ),
+        color=team_info["color"]
     )
+
     for ch_id, data in rooms_data.items():
-        channel = guild.get_channel(ch_id)
-        if channel:
-            members_mentions = [guild.get_member(m_id).mention for m_id in data["members"] if guild.get_member(m_id)]
-            occupants_str = "\n".join(members_mentions) if members_mentions else "*Personne sur place*"
-            status_icon = "🔴" if len(data["members"]) >= data["capacity"] else "🟢"
-            embed.add_field(
-                name=f"{status_icon} {data['name'].capitalize()} ({len(data['members'])}/{data['capacity']})", 
-                value=occupants_str, 
-                inline=True
-            )
+        if data["team"] == team_name:
+            channel = guild.get_channel(ch_id)
+            if channel:
+                members_mentions = [guild.get_member(m_id).mention for m_id in data["members"] if guild.get_member(m_id)]
+                occupants_str = "\n".join(members_mentions) if members_mentions else "*Personne sur place*"
+                status_icon = "🔴" if len(data["members"]) >= data["capacity"] else "🟢"
+                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+
+                embed.add_field(
+                    name=f"{status_icon} {clean_name} ({len(data['members'])}/{data['capacity']})",
+                    value=occupants_str,
+                    inline=True
+                )
     return embed
 
 
-async def refresh_dashboard(guild):
-    global dashboard_message
-    if dashboard_message:
-        try:
-            await dashboard_message.edit(embed=generate_dashboard_embed(guild), view=DashboardView(guild))
-        except Exception as e:
-            print(f"Erreur refresh dashboard : {e}")
+async def refresh_all_dashboards(guild):
+    """Met à jour les dashboards des deux équipes."""
+    for team_name, message in dashboard_messages.items():
+        if message:
+            try:
+                await message.edit(
+                    embed=generate_dashboard_embed(guild, team_name),
+                    view=DashboardView(guild, team_name)
+                )
+            except Exception as e:
+                print(f"Erreur actualisation dashboard {team_name} : {e}")
 
 
 async def user_leaves_room(user, guild):
+    """Retire un membre de sa salle actuelle avec purge et archive."""
     current_ch_id = None
     for ch_id, data in rooms_data.items():
         if user.id in data["members"]:
@@ -116,7 +137,7 @@ async def user_leaves_room(user, guild):
     if channel and len(room["members"]) > 0:
         await send_room_control_panel(channel, guild)
 
-    await refresh_dashboard(guild)
+    await refresh_all_dashboards(guild)
     return True, f"Vous avez quitté {room['name']}."
 
 
@@ -124,64 +145,90 @@ class InsideRoomView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🚪 Quitter cet endroit", style=discord.ButtonStyle.danger, custom_id="btn_leave_inside_room")
+    @discord.ui.button(label="🚪 Quitter cet endroit", style=discord.ButtonStyle.danger, custom_id="btn_leave_inside")
     async def leave_inside_callback(self, interaction: discord.Interaction, button: Button):
+        # Réponse différée pour éviter l'erreur 10062
+        await interaction.response.defer(ephemeral=True)
         success, msg = await user_leaves_room(interaction.user, interaction.guild)
-        await interaction.response.send_message("✅ Vous êtes sorti du lieu." if success else f"ℹ️ {msg}", ephemeral=True)
+        await interaction.followup.send("✅ Vous êtes sorti du lieu." if success else f"ℹ️ {msg}", ephemeral=True)
 
 
 class DashboardView(View):
-    def __init__(self, guild):
+    def __init__(self, guild, team_name):
         super().__init__(timeout=None)
         self.guild = guild
-        
+        self.team_name = team_name
+
         options = []
         for ch_id, data in rooms_data.items():
-            nb = len(data["members"])
-            cap = data["capacity"]
-            options.append(discord.SelectOption(
-                label=f"{data['name'].capitalize()} ({nb}/{cap})", 
-                value=str(ch_id), 
-                description="Complet !" if nb >= cap else f"Rejoindre ({cap - nb} place(s))",
-                emoji="🔴" if nb >= cap else "🟢"
-            ))
+            if data["team"] == team_name:
+                nb = len(data["members"])
+                cap = data["capacity"]
+                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+                
+                options.append(discord.SelectOption(
+                    label=f"{clean_name} ({nb}/{cap})",
+                    value=str(ch_id),
+                    description="Complet !" if nb >= cap else f"Rejoindre ({cap - nb} place(s) restante(s))",
+                    emoji="🔴" if nb >= cap else "🟢"
+                ))
 
         if options:
-            select = Select(placeholder="📍 Choisir un lieu...", options=options, custom_id="select_location_hub")
+            select = Select(
+                placeholder=f"📍 Lieux — {team_name}...",
+                options=options,
+                custom_id=f"select_{team_name.lower().replace(' ', '_')}"
+            )
             select.callback = self.join_room_callback
             self.add_item(select)
 
     async def join_room_callback(self, interaction: discord.Interaction):
+        # 1. Différer la réponse immédiatement pour bloquer l'erreur Discord Timeout (10062)
+        await interaction.response.defer(ephemeral=True)
+
         user = interaction.user
         target_channel_id = int(interaction.data["values"][0])
-        
+
         if target_channel_id not in rooms_data:
-            await interaction.response.send_message("❌ Salon introuvable.", ephemeral=True)
+            await interaction.followup.send("❌ Ce salon est introuvable.", ephemeral=True)
             return
 
-        room = rooms_data[target_channel_id]
-        channel = self.guild.get_channel(target_channel_id)
+        target_room = rooms_data[target_channel_id]
+        target_channel = self.guild.get_channel(target_channel_id)
 
-        if user.id in room["members"]:
-            await interaction.response.send_message("ℹ️ Vous êtes déjà ici.", ephemeral=True)
+        # Vérification du rôle d'équipe
+        user_roles_names = [role.name for role in user.roles]
+        if target_room["team"] not in user_roles_names:
+            await interaction.followup.send(f"⛔ Vous n'appartenez pas à l'**{target_room['team']}** !", ephemeral=True)
             return
 
-        for data in rooms_data.values():
+        # Si l'utilisateur est déjà dans ce salon précis
+        if user.id in target_room["members"]:
+            await interaction.followup.send("ℹ️ Vous êtes déjà dans ce lieu.", ephemeral=True)
+            return
+
+        # S'il est dans un autre salon : le faire quitter automatiquement avant d'entrer
+        for ch_id, data in rooms_data.items():
             if user.id in data["members"]:
-                await interaction.response.send_message("❌ Quittez votre salon actuel d'abord !", ephemeral=True)
-                return
+                await user_leaves_room(user, self.guild)
+                break
 
-        if len(room["members"]) >= room["capacity"]:
-            await interaction.response.send_message("⛔ Ce lieu est plein.", ephemeral=True)
+        # Vérifier la capacité
+        if len(target_room["members"]) >= target_room["capacity"]:
+            await interaction.followup.send("⛔ Ce lieu est plein.", ephemeral=True)
             return
 
-        await archive_and_purge(channel, self.guild, f"{user.name} a REJOINT {room['name']}")
-        room["members"].append(user.id)
-        await channel.set_permissions(user, read_messages=True, send_messages=True, read_message_history=True)
+        # Purge et archive du nouveau salon
+        await archive_and_purge(target_channel, self.guild, f"{user.name} a REJOINT {target_room['name']}")
 
-        await interaction.response.send_message(f"✅ Direction **{room['name'].capitalize()}** ! {channel.mention}", ephemeral=True)
-        await send_room_control_panel(channel, self.guild)
-        await refresh_dashboard(self.guild)
+        # Donner l'accès
+        target_room["members"].append(user.id)
+        await target_channel.set_permissions(user, read_messages=True, send_messages=True, read_message_history=True)
+
+        clean_name = target_room['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+        await interaction.followup.send(f"✅ Direction **{clean_name}** ! {target_channel.mention}", ephemeral=True)
+        await send_room_control_panel(target_channel, self.guild)
+        await refresh_all_dashboards(self.guild)
 
 
 @bot.command()
@@ -194,27 +241,54 @@ async def quitter(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
-    global dashboard_message, rooms_data
+    """Initialise les rôles, catégories, salons par équipe et dashboards."""
+    global dashboard_messages, rooms_data
     await ctx.message.delete()
-    
-    for name, capacity in PRESET_ROOMS_CONFIG.items():
-        channel = discord.utils.get(ctx.guild.text_channels, name=name)
-        if not channel:
-            overwrites = {
-                ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-            }
-            channel = await ctx.guild.create_text_channel(name=name, overwrites=overwrites)
-            
-        rooms_data[channel.id] = {"name": name, "capacity": capacity, "members": []}
+    guild = ctx.guild
 
-    embed = generate_dashboard_embed(ctx.guild)
-    view = DashboardView(ctx.guild)
-    dashboard_message = await ctx.send(embed=embed, view=view)
+    for team_name, config in TEAMS_CONFIG.items():
+        # 1. Créer ou récupérer le rôle d'équipe
+        role = discord.utils.get(guild.roles, name=team_name)
+        if not role:
+            role = await guild.create_role(name=team_name, color=config["color"])
+
+        # 2. Créer ou récupérer la catégorie d'équipe (fermée aux autres rôles)
+        cat_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            role: discord.PermissionOverwrite(read_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+        category = discord.utils.get(guild.categories, name=team_name.upper())
+        if not category:
+            category = await guild.create_category(name=team_name.upper(), overwrites=cat_overwrites)
+
+        # 3. Créer les salons de l'équipe dans sa catégorie
+        for channel_name, capacity in config["rooms"].items():
+            channel = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+            if not channel:
+                room_overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    role: discord.PermissionOverwrite(read_messages=False),  # Invisible jusqu'à ce qu'ils le rejoignent
+                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                }
+                channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=room_overwrites)
+
+            rooms_data[channel.id] = {
+                "name": channel_name,
+                "team": team_name,
+                "capacity": capacity,
+                "members": []
+            }
+
+        # 4. Envoyer le Dashboard dédié à l'équipe dans le salon où la commande est tapée
+        embed = generate_dashboard_embed(guild, team_name)
+        view = DashboardView(guild, team_name)
+        msg = await ctx.send(embed=embed, view=view)
+        dashboard_messages[team_name] = msg
 
 
 @bot.event
 async def on_ready():
-    print(f"🤖 Connecté en tant que : {bot.user}")
+    print(f"🤖 Bot connecté sous le nom de : {bot.user}")
 
 bot.run(TOKEN)
