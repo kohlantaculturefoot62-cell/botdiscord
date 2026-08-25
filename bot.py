@@ -311,34 +311,63 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def expulser(ctx, member: discord.Member):
-    """Permet aux admins/modos d'éjecter un candidat d'un salon : !expulser @Membre"""
-    # 1. Vérifier si le membre est bien dans un salon
-    user_room_id = None
+    """Expulse un candidat d'un salon secret, même après un redémarrage du bot."""
+    found_channel = None
+    found_room_name = None
+
+    # 1. Vérifier d'abord dans la mémoire
     for ch_id, data in rooms_data.items():
         if member.id in data["members"]:
-            user_room_id = ch_id
+            found_channel = ctx.guild.get_channel(ch_id)
+            found_room_name = data["name"]
             break
 
-    if not user_room_id:
-        await ctx.send(f"❌ {member.mention} n'est actuellement dans aucun salon secret.", delete_after=5)
+    # 2. Si pas trouvé en mémoire (ex: bot a redémarré), scanner les salons réels
+    if not found_channel:
+        for team_name, config in TEAMS_CONFIG.items():
+            category = ctx.guild.get_channel(config["category_id"])
+            if category:
+                for ch in category.text_channels:
+                    # Vérifier si le membre a la permission explicite de voir ce salon
+                    overwrites = ch.overwrites_for(member)
+                    if overwrites.read_messages is True:
+                        found_channel = ch
+                        found_room_name = ch.name
+                        break
+            if found_channel:
+                break
+
+    if not found_channel:
+        await ctx.send(f"❌ {member.mention} n'a d'accès à aucun salon secret actuellement.", delete_after=6)
         return
 
-    room_name = rooms_data[user_room_id]["name"].replace("-rouge", "").replace("-jaune", "").capitalize()
+    # 3. Archiver et vider le salon
+    clean_name = found_room_name.replace("-rouge", "").replace("-jaune", "").capitalize()
+    await archive_and_purge(found_channel, ctx.guild, f"{member.name} a été EXPULSÉ de {clean_name}")
 
-    # 2. Sortir le joueur (archive, purge et mise à jour du dashboard)
-    success, msg = await user_leaves_room(member, ctx.guild)
+    # 4. Retirer les permissions Discord du membre
+    await found_channel.set_permissions(member, overwrite=None)
 
-    if success:
-        await ctx.send(f"👟 **{member.display_name}** a été expulsé(e) du lieu **{room_name}**.", delete_after=8)
-        # Optionnel : Envoyer un message privé au joueur expulsé
-        try:
-            await member.send(f"⏳ Vous avez été retiré(e) du lieu **{room_name}** (temps écoulé / décision de l'arbitre).")
-        except discord.Forbidden:
-            pass
-    else:
-        await ctx.send(f"⚠️ Erreur lors de l'expulsion : {msg}", delete_after=5)
+    # 5. Nettoyer la mémoire si le salon y était
+    if found_channel.id in rooms_data:
+        if member.id in rooms_data[found_channel.id]["members"]:
+            rooms_data[found_channel.id]["members"].remove(member.id)
+        
+        # Mettre à jour l'accueil dans le salon s'il reste du monde
+        if len(rooms_data[found_channel.id]["members"]) > 0:
+            await send_room_control_panel(found_channel, ctx.guild)
+        
+        # Actualiser le tableau de bord
+        await refresh_dashboard_team(ctx.guild, rooms_data[found_channel.id]["team"])
 
-    # Nettoyer la commande écrite pour garder le salon propre
+    # 6. Messages de confirmation
+    await ctx.send(f"👟 **{member.display_name}** a été expulsé(e) du lieu **{clean_name}**.", delete_after=8)
+    
+    try:
+        await member.send(f"⏳ Vous avez été retiré(e) du salon **{clean_name}** par l'arbitre.")
+    except discord.Forbidden:
+        pass
+
     try:
         await ctx.message.delete()
     except discord.Forbidden:
