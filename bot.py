@@ -5,160 +5,221 @@ import io
 
 # --- CONFIGURATION ---
 TOKEN = "TON_TOKEN_DISCORD_ICI"
-ADMIN_LOG_CHANNEL_ID = 123456789012345678 # Remplace par l'ID de ton salon admin
-MAX_CAPACITY = 3 # Limite max par salon
+ADMIN_LOG_CHANNEL_ID = 123456789012345678  # Remplace par l'ID de ton salon admin
+CATEGORY_ID = None  # (Optionnel) ID de la catégorie où regrouper ces salons
 
-# Dictionnaire pour stocker l'état des salons : {channel_id: [liste_des_membres_id]}
-active_rooms = {}
+# Salons prédéfinis avec leurs limites respectives
+PRESET_ROOMS_CONFIG = {
+    "point-d-eau": 3,
+    "foret": 3,
+    "plage": 4,
+    "riviere": 5
+}
+
+# Structure en mémoire : {channel_id: {"name": str, "capacity": int, "members": [user_ids]}}
+rooms_data = {}
+dashboard_message = None
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Fonction pour archiver et purger un salon
-async def archive_and_purge(channel, guild, action_text):
+
+# --- FONCTIONS UTILITAIRES ---
+
+async def archive_and_purge(channel, guild, reason_text):
+    """Archive tous les messages vers le salon admin puis vide le salon."""
     admin_channel = guild.get_channel(ADMIN_LOG_CHANNEL_ID)
+    messages = [msg async for msg in channel.history(limit=200, oldest_first=True)]
     
-    # Récupérer l'historique des messages (du plus ancien au plus récent)
-    messages = [msg async for msg in channel.history(limit=100, oldest_first=True)]
-    
-    if len(messages) > 0:
-        # Formater les messages dans un texte
-        log_text = f"--- ARCHIVE : {channel.name} ({action_text}) ---\n\n"
+    if messages and admin_channel:
+        log_text = f"=== ARCHIVE : {channel.name} ===\nÉvénement : {reason_text}\n\n"
         for msg in messages:
-            if not msg.author.bot: # Optionnel : ignorer les messages du bot
+            if not msg.author.bot:
                 log_text += f"[{msg.created_at.strftime('%H:%M:%S')}] {msg.author.name} : {msg.content}\n"
         
-        # Créer un fichier texte en mémoire pour éviter la limite de caractères de Discord
-        file = discord.File(fp=io.BytesIO(log_text.encode('utf-8')), filename=f"log_{channel.name}.txt")
-        await admin_channel.send(content=f"📁 **Nouvelle archive de {channel.mention}** suite à : *{action_text}*", file=file)
+        file = discord.File(
+            fp=io.BytesIO(log_text.encode('utf-8')), 
+            filename=f"log_{channel.name}_{msg.created_at.strftime('%d%m%Y_%H%M%S')}.txt"
+        )
+        await admin_channel.send(content=f"📁 **Archive de {channel.mention}** (`{reason_text}`)", file=file)
     
-    # Supprimer tous les messages du salon
-    await channel.purge(limit=100)
+    # Nettoie le salon
+    await channel.purge(limit=200)
 
-# Fonction pour générer l'Embed (Tableau de bord)
+
 def generate_dashboard_embed(guild):
+    """Génère le tableau de bord avec l'état de chaque zone."""
     embed = discord.Embed(
-        title="🎮 Hub de sélection des salons", 
-        description="Choisissez un salon à rejoindre. Les discussions sont secrètes et s'effacent dès que quelqu'un entre ou sort !", 
-        color=discord.Color.blurple()
+        title="🗺️ Carte des Lieux de Rencontre", 
+        description=(
+            "Sélectionnez un lieu dans le menu ci-dessous pour vous y rendre.\n\n"
+            "⚠️ **Règle de confidentialité :**\n"
+            "Dès qu'un candidat entre ou quitte une zone, la conversation est archivée aux admins et le salon redevient totalement vierge."
+        ), 
+        color=discord.Color.teal()
     )
     
-    for channel_id, members in active_rooms.items():
-        channel = guild.get_channel(channel_id)
+    for ch_id, data in rooms_data.items():
+        channel = guild.get_channel(ch_id)
         if channel:
-            # Créer la liste des noms ou afficher "Vide"
-            member_names = [guild.get_member(m_id).mention for m_id in members if guild.get_member(m_id)]
-            occupants = "\n".join(member_names) if member_names else "*Vide*"
+            members_mentions = [guild.get_member(m_id).mention for m_id in data["members"] if guild.get_member(m_id)]
+            occupants_str = "\n".join(members_mentions) if members_mentions else "*Personne sur place*"
+            
+            is_full = len(data["members"]) >= data["capacity"]
+            status_icon = "🔴" if is_full else "🟢"
             
             embed.add_field(
-                name=f"🚪 {channel.name} ({len(members)}/{MAX_CAPACITY})", 
-                value=occupants, 
+                name=f"{status_icon} {data['name'].capitalize()} ({len(data['members'])}/{data['capacity']})", 
+                value=occupants_str, 
                 inline=True
             )
             
     return embed
 
-# --- INTERFACE UTILISATEUR (Boutons et Menu) ---
+
+async def refresh_dashboard(guild):
+    """Met à jour le message du Dashboard en temps réel."""
+    global dashboard_message
+    if dashboard_message:
+        try:
+            await dashboard_message.edit(embed=generate_dashboard_embed(guild), view=DashboardView(guild))
+        except Exception as e:
+            print(f"Erreur d'actualisation du dashboard: {e}")
+
+
+# --- VUE INTERACTIVE (MENU ET BOUTON) ---
+
 class DashboardView(View):
     def __init__(self, guild):
         super().__init__(timeout=None)
         self.guild = guild
         
-        # Menu déroulant pour choisir un salon
+        # Menu déroulant listant tous les lieux fixes
         options = []
-        for channel_id in active_rooms.keys():
-            channel = guild.get_channel(channel_id)
-            if channel:
-                options.append(discord.SelectOption(label=channel.name, value=str(channel_id), description=f"Rejoindre ce salon"))
-        
-        self.select = Select(placeholder="Où voulez-vous aller ?", options=options, custom_id="room_select")
-        self.select.callback = self.join_callback
-        self.add_item(self.select)
+        for ch_id, data in rooms_data.items():
+            nb = len(data["members"])
+            cap = data["capacity"]
+            label_txt = f"{data['name'].capitalize()} ({nb}/{cap})"
+            desc = "Complet !" if nb >= cap else f"Rejoindre ce lieu ({cap - nb} place(s) restante(s))"
+            
+            options.append(discord.SelectOption(
+                label=label_txt, 
+                value=str(ch_id), 
+                description=desc,
+                emoji="🔴" if nb >= cap else "🟢"
+            ))
 
-    async def join_callback(self, interaction: discord.Interaction):
+        if options:
+            select = Select(
+                placeholder="📍 Choisir un lieu à explorer...", 
+                options=options, 
+                custom_id="select_location"
+            )
+            select.callback = self.join_room_callback
+            self.add_item(select)
+
+    async def join_room_callback(self, interaction: discord.Interaction):
         user = interaction.user
-        target_channel_id = int(self.select.values[0])
-        target_channel = self.guild.get_channel(target_channel_id)
+        target_channel_id = int(interaction.data["values"][0])
         
-        # Vérifier si l'utilisateur est déjà dans un salon
-        for ch_id, members in active_rooms.items():
-            if user.id in members:
-                await interaction.response.send_message("Vous êtes déjà dans un salon ! Quittez-le d'abord.", ephemeral=True)
+        if target_channel_id not in rooms_data:
+            await interaction.response.send_message("❌ Ce salon est introuvable.", ephemeral=True)
+            return
+
+        room = rooms_data[target_channel_id]
+        channel = self.guild.get_channel(target_channel_id)
+
+        # 1. Vérifications préalables
+        if user.id in room["members"]:
+            await interaction.response.send_message("ℹ️ Vous êtes déjà dans ce lieu.", ephemeral=True)
+            return
+
+        for data in rooms_data.values():
+            if user.id in data["members"]:
+                await interaction.response.send_message("❌ Vous êtes déjà dans un autre lieu ! Quittez-le avant d'en changer.", ephemeral=True)
                 return
-                
-        # Vérifier la capacité
-        if len(active_rooms[target_channel_id]) >= MAX_CAPACITY:
-            await interaction.response.send_message("Ce salon est plein !", ephemeral=True)
+
+        if len(room["members"]) >= room["capacity"]:
+            await interaction.response.send_message("⛔ Ce lieu a atteint sa capacité maximale.", ephemeral=True)
             return
 
-        # Archiver et purger le salon AVANT que l'utilisateur n'y entre
-        await archive_and_purge(target_channel, self.guild, f"{user.name} a rejoint")
+        # 2. Archive et purge avant que le nouvel arrivant ne puisse lire
+        await archive_and_purge(channel, self.guild, f"{user.name} a REJOINT {room['name']}")
 
-        # Ajouter l'utilisateur au salon
-        active_rooms[target_channel_id].append(user.id)
-        
-        # Modifier les permissions pour lui donner accès
-        await target_channel.set_permissions(user, read_messages=True, send_messages=True)
-        
-        # Mettre à jour le tableau de bord
-        await interaction.response.edit_message(embed=generate_dashboard_embed(self.guild), view=self)
-        await user.send(f"Vous avez rejoint {target_channel.name} !")
+        # 3. Donner l'accès au nouveau candidat
+        room["members"].append(user.id)
+        await channel.set_permissions(user, read_messages=True, send_messages=True, read_message_history=True)
 
-    @discord.ui.button(label="🚪 Quitter mon salon", style=discord.ButtonStyle.danger, custom_id="leave_btn")
-    async def leave_callback(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(f"✅ Vous avez rejoint le salon {channel.mention} !", ephemeral=True)
+        await refresh_dashboard(self.guild)
+
+    @discord.ui.button(label="🚪 Quitter mon lieu actuel", style=discord.ButtonStyle.danger, custom_id="btn_leave_location")
+    async def leave_btn(self, interaction: discord.Interaction, button: Button):
         user = interaction.user
-        current_room_id = None
-        
-        # Trouver dans quel salon est l'utilisateur
-        for ch_id, members in active_rooms.items():
-            if user.id in members:
-                current_room_id = ch_id
+        current_ch_id = None
+
+        for ch_id, data in rooms_data.items():
+            if user.id in data["members"]:
+                current_ch_id = ch_id
                 break
-                
-        if not current_room_id:
-            await interaction.response.send_message("Vous n'êtes dans aucun salon.", ephemeral=True)
+
+        if not current_ch_id:
+            await interaction.response.send_message("ℹ️ Vous n'êtes actuellement dans aucun lieu.", ephemeral=True)
             return
 
-        channel = self.guild.get_channel(current_room_id)
-        
-        # Archiver et purger le salon car quelqu'un part
-        await archive_and_purge(channel, self.guild, f"{user.name} a quitté")
-        
-        # Retirer l'utilisateur du salon
-        active_rooms[current_room_id].remove(user.id)
-        
-        # Retirer les permissions (le ramener à l'état par défaut)
-        await channel.set_permissions(user, overwrite=None)
-        
-        # Mettre à jour le tableau de bord
-        await interaction.response.edit_message(embed=generate_dashboard_embed(self.guild), view=self)
-        await interaction.followup.send("Vous avez quitté le salon. Les messages ont été effacés.", ephemeral=True)
+        channel = self.guild.get_channel(current_ch_id)
+        room = rooms_data[current_ch_id]
+
+        # 1. Archive et purge
+        if channel:
+            await archive_and_purge(channel, self.guild, f"{user.name} a QUITTÉ {room['name']}")
+            await channel.set_permissions(user, overwrite=None)
+
+        # 2. Retirer l'utilisateur
+        room["members"].remove(user.id)
+
+        await interaction.response.send_message("✅ Vous avez quitté le lieu.", ephemeral=True)
+        await refresh_dashboard(self.guild)
 
 
-# --- COMMANDES D'ADMINISTRATION ---
+# --- INITIALISATION ET COMMANDES ADMIN ---
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
-    # Créer 3 salons de test si la liste est vide
-    if not active_rooms:
-        for i in range(1, 4):
-            # Le rôle @everyone ne peut pas voir/lire ces salons
+    """Commande à taper pour initialiser les salons et afficher la carte."""
+    global dashboard_message, rooms_data
+    await ctx.message.delete()
+    
+    category = ctx.guild.get_channel(CATEGORY_ID) if CATEGORY_ID else None
+    
+    # Création ou détection des 4 salons prédéfinis
+    for name, capacity in PRESET_ROOMS_CONFIG.items():
+        # Chercher si le salon existe déjà
+        channel = discord.utils.get(ctx.guild.text_channels, name=name)
+        
+        if not channel:
             overwrites = {
                 ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False),
                 ctx.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
             }
-            new_channel = await ctx.guild.create_text_channel(f"salon-secret-{i}", overwrites=overwrites)
-            active_rooms[new_channel.id] = []
+            channel = await ctx.guild.create_text_channel(name=name, category=category, overwrites=overwrites)
             
-    # Envoyer le tableau de bord
+        rooms_data[channel.id] = {
+            "name": name,
+            "capacity": capacity,
+            "members": []
+        }
+
+    # Envoi du message du tableau de bord
     embed = generate_dashboard_embed(ctx.guild)
     view = DashboardView(ctx.guild)
-    await ctx.send(embed=embed, view=view)
+    dashboard_message = await ctx.send(embed=embed, view=view)
 
 @bot.event
 async def on_ready():
-    print(f'Connecté en tant que {bot.user}')
+    print(f"🤖 Bot prêt et connecté en tant que : {bot.user}")
 
 bot.run(TOKEN)
