@@ -3,9 +3,9 @@ from discord.ext import commands
 from discord.ui import View, Select, Button
 import io
 
-# --- CONFIGURATION ---
-TOKEN = "MTU0MTg5ODAzNjE2MTAyMDA1NQ.G_nY28.K2LUJwNdvnm9SRp1h86hTUjtAv31XELMBLdlLY"
-ADMIN_LOG_CHANNEL_ID = 123456789012345678  # ID de ton salon admin
+# --- RÉCUPÉRATION DES SECRETS DE L'HÉBERGEUR ---
+TOKEN = os.getenv("DISCORD_TOKEN")
+ADMIN_LOG_CHANNEL_ID = int(os.getenv("ADMIN_LOG_CHANNEL_ID", 0))
 CATEGORY_ID = None  # (Optionnel) ID de la catégorie des salons
 
 # Salons prédéfinis avec leurs limites
