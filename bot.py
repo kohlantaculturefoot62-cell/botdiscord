@@ -308,4 +308,40 @@ async def quitter(ctx):
 async def on_ready():
     print(f"🤖 Bot connecté : {bot.user}")
 
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def expulser(ctx, member: discord.Member):
+    """Permet aux admins/modos d'éjecter un candidat d'un salon : !expulser @Membre"""
+    # 1. Vérifier si le membre est bien dans un salon
+    user_room_id = None
+    for ch_id, data in rooms_data.items():
+        if member.id in data["members"]:
+            user_room_id = ch_id
+            break
+
+    if not user_room_id:
+        await ctx.send(f"❌ {member.mention} n'est actuellement dans aucun salon secret.", delete_after=5)
+        return
+
+    room_name = rooms_data[user_room_id]["name"].replace("-rouge", "").replace("-jaune", "").capitalize()
+
+    # 2. Sortir le joueur (archive, purge et mise à jour du dashboard)
+    success, msg = await user_leaves_room(member, ctx.guild)
+
+    if success:
+        await ctx.send(f"👟 **{member.display_name}** a été expulsé(e) du lieu **{room_name}**.", delete_after=8)
+        # Optionnel : Envoyer un message privé au joueur expulsé
+        try:
+            await member.send(f"⏳ Vous avez été retiré(e) du lieu **{room_name}** (temps écoulé / décision de l'arbitre).")
+        except discord.Forbidden:
+            pass
+    else:
+        await ctx.send(f"⚠️ Erreur lors de l'expulsion : {msg}", delete_after=5)
+
+    # Nettoyer la commande écrite pour garder le salon propre
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+        
 bot.run(TOKEN)
