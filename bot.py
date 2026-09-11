@@ -7,12 +7,12 @@ from discord.ui import View, Select, Button
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_LOG_CHANNEL_ID = int(os.getenv("ADMIN_LOG_CHANNEL_ID", 0))
 
-# --- IDS DES CATÉGORIES (Clic droit sur la catégorie -> Copier l'identifiant) ---
-CATEGORY_ROUGE_ID = 1541039212227465266  # Remplacez par l'ID de votre catégorie Rouge
-CATEGORY_JAUNE_ID = 1541039252064833547  # Remplacez par l'ID de votre catégorie Jaune
+# --- IDS DES CATÉGORIES ---
+CATEGORY_ROUGE_ID = 1541039212227465266  # ID de la catégorie Sangaré (ex-Rouge)
+CATEGORY_JAUNE_ID = 1541039252064833547  # ID de la catégorie Muntari (ex-Jaune)
 
 TEAMS_CONFIG = {
-    "Rouge": {
+    "Sangaré": {
         "color": discord.Color.red(),
         "category_id": CATEGORY_ROUGE_ID,
         "rooms": {
@@ -22,7 +22,7 @@ TEAMS_CONFIG = {
             "riviere-rouge": 5
         }
     },
-    "Jaune": {
+    "Muntari": {
         "color": discord.Color.gold(),
         "category_id": CATEGORY_JAUNE_ID,
         "rooms": {
@@ -34,7 +34,6 @@ TEAMS_CONFIG = {
     }
 }
 
-# Structure : {channel_id: {"name": str, "team": str, "capacity": int, "members": [user_ids]}}
 rooms_data = {}
 dashboard_messages = {}
 
@@ -210,7 +209,7 @@ class DashboardView(View):
         target_room = rooms_data[target_channel_id]
         target_channel = self.guild.get_channel(target_channel_id)
 
-        # Vérification du rôle d'équipe
+        # Vérification du rôle d'équipe (Sangaré ou Muntari)
         user_roles_names = [role.name for role in user.roles]
         if target_room["team"] not in user_roles_names:
             await interaction.followup.send(f"⛔ Vous devez avoir le rôle **{target_room['team']}** pour utiliser ceci !", ephemeral=True)
@@ -220,21 +219,17 @@ class DashboardView(View):
             await interaction.followup.send("ℹ️ Vous êtes déjà dans ce lieu.", ephemeral=True)
             return
 
-        # S'il est dans une autre pièce, le sortir d'abord
         for ch_id, data in rooms_data.items():
             if user.id in data["members"]:
                 await user_leaves_room(user, self.guild)
                 break
 
-        # Vérifier la capacité
         if len(target_room["members"]) >= target_room["capacity"]:
             await interaction.followup.send("⛔ Ce lieu a atteint sa capacité maximale.", ephemeral=True)
             return
 
-        # Purge et archive du nouveau salon
         await archive_and_purge(target_channel, self.guild, f"{user.name} a REJOINT {target_room['name']}")
 
-        # Donner l'accès
         target_room["members"].append(user.id)
         await target_channel.set_permissions(user, read_messages=True, send_messages=True, read_message_history=True)
 
@@ -256,12 +251,10 @@ async def handle_team_setup(ctx, team_name):
         await ctx.send(f"❌ Erreur : Impossible de trouver la catégorie pour {team_name}. Vérifiez l'ID !", delete_after=10)
         return
 
-    # S'assurer que le rôle existe
     role = discord.utils.get(guild.roles, name=team_name)
     if not role:
         role = await guild.create_role(name=team_name, color=config["color"])
 
-    # Création des salons dans votre catégorie existante
     for channel_name, capacity in config["rooms"].items():
         channel = discord.utils.get(category.text_channels, name=channel_name)
         if not channel:
@@ -287,15 +280,15 @@ async def handle_team_setup(ctx, team_name):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setup_rouge(ctx):
-    """À taper dans le salon d'accueil de l'équipe Rouge."""
-    await handle_team_setup(ctx, "Rouge")
+async def setup_sangare(ctx):
+    """À taper dans le salon d'accueil de l'équipe Sangaré."""
+    await handle_team_setup(ctx, "Sangaré")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setup_jaune(ctx):
-    """À taper dans le salon d'accueil de l'équipe Jaune."""
-    await handle_team_setup(ctx, "Jaune")
+async def setup_muntari(ctx):
+    """À taper dans le salon d'accueil de l'équipe Muntari."""
+    await handle_team_setup(ctx, "Muntari")
 
 @bot.command()
 async def quitter(ctx):
@@ -315,20 +308,17 @@ async def expulser(ctx, member: discord.Member):
     found_channel = None
     found_room_name = None
 
-    # 1. Vérifier d'abord dans la mémoire
     for ch_id, data in rooms_data.items():
         if member.id in data["members"]:
             found_channel = ctx.guild.get_channel(ch_id)
             found_room_name = data["name"]
             break
 
-    # 2. Si pas trouvé en mémoire (ex: bot a redémarré), scanner les salons réels
     if not found_channel:
         for team_name, config in TEAMS_CONFIG.items():
             category = ctx.guild.get_channel(config["category_id"])
             if category:
                 for ch in category.text_channels:
-                    # Vérifier si le membre a la permission explicite de voir ce salon
                     overwrites = ch.overwrites_for(member)
                     if overwrites.read_messages is True:
                         found_channel = ch
@@ -341,26 +331,20 @@ async def expulser(ctx, member: discord.Member):
         await ctx.send(f"❌ {member.mention} n'a d'accès à aucun salon secret actuellement.", delete_after=6)
         return
 
-    # 3. Archiver et vider le salon
     clean_name = found_room_name.replace("-rouge", "").replace("-jaune", "").capitalize()
     await archive_and_purge(found_channel, ctx.guild, f"{member.name} a été EXPULSÉ de {clean_name}")
 
-    # 4. Retirer les permissions Discord du membre
     await found_channel.set_permissions(member, overwrite=None)
 
-    # 5. Nettoyer la mémoire si le salon y était
     if found_channel.id in rooms_data:
         if member.id in rooms_data[found_channel.id]["members"]:
             rooms_data[found_channel.id]["members"].remove(member.id)
         
-        # Mettre à jour l'accueil dans le salon s'il reste du monde
         if len(rooms_data[found_channel.id]["members"]) > 0:
             await send_room_control_panel(found_channel, ctx.guild)
         
-        # Actualiser le tableau de bord
         await refresh_dashboard_team(ctx.guild, rooms_data[found_channel.id]["team"])
 
-    # 6. Messages de confirmation
     await ctx.send(f"👟 **{member.display_name}** a été expulsé(e) du lieu **{clean_name}**.", delete_after=8)
     
     try:
