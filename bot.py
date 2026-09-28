@@ -46,21 +46,17 @@ class KohLantaBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # 1. Enregistre le bouton de sortie persistant
         self.add_view(InsideRoomView())
 
     async def on_ready(self):
-        # 2. Reconstruit les états des pièces à partir de Discord
         await restore_state_from_discord(self)
-        
-        # 3. Synchronise les Slash Commands avec Discord
+
         try:
             synced = await self.tree.sync()
             print(f"✅ {len(synced)} commandes slash synchronisées.")
         except Exception as e:
-            print(f"❌ Erreur lors de la synchronisation des commandes : {e}")
+            print(f"❌ Erreur synchronisation commandes : {e}")
 
-        # 4. Enregistre les Dashboards maintenant que rooms_data est rempli
         for team_name in TEAMS_CONFIG.keys():
             self.add_view(DashboardView(team_name))
 
@@ -74,14 +70,14 @@ bot = KohLantaBot()
 # ==========================================
 
 async def restore_state_from_discord(bot_instance):
-    """Scanne les catégories Discord pour reconstruire rooms_data."""
+    """Scanne uniquement les catégories définies pour reconstruire rooms_data proprement."""
     global rooms_data
     rooms_data.clear()
 
     for guild in bot_instance.guilds:
         for team_name, config in TEAMS_CONFIG.items():
             category = guild.get_channel(config["category_id"])
-            if not category:
+            if not category or not isinstance(category, discord.CategoryChannel):
                 continue
 
             for room_name, capacity in config["rooms"].items():
@@ -89,7 +85,6 @@ async def restore_state_from_discord(bot_instance):
                 if not channel:
                     continue
 
-                # Récupère les membres avec accès explicite
                 occupants = []
                 for target, overwrite in channel.overwrites.items():
                     if isinstance(target, discord.Member) and not target.bot:
@@ -204,7 +199,6 @@ async def user_leaves_room(user, guild):
             current_ch_id = ch_id
             break
 
-    # Fail-safe supplémentaire : inspection directe des permissions
     if not current_ch_id:
         for ch_id, data in rooms_data.items():
             ch = guild.get_channel(ch_id)
@@ -299,7 +293,6 @@ class DashboardView(View):
         target_room = rooms_data[target_channel_id]
         target_channel = guild.get_channel(target_channel_id)
 
-        # Vérification du rôle d'équipe
         user_roles_names = [role.name for role in user.roles]
         if target_room["team"] not in user_roles_names:
             await interaction.followup.send(f"⛔ Vous devez avoir le rôle **{target_room['team']}** pour utiliser ceci !", ephemeral=True)
@@ -309,7 +302,6 @@ class DashboardView(View):
             await interaction.followup.send("ℹ️ Vous êtes déjà dans ce lieu.", ephemeral=True)
             return
 
-        # Sortir de l'ancien salon si nécessaire
         for ch_id, data in rooms_data.items():
             if user.id in data["members"]:
                 await user_leaves_room(user, guild)
@@ -335,16 +327,21 @@ class DashboardView(View):
 # ==========================================
 
 async def setup_team_helper(interaction: discord.Interaction, team_name: str):
-    """Fonction commune pour générer le tableau de bord et les salons."""
+    """Crée ou réutilise les salons sans créer de doublons en mémoire."""
     global dashboard_messages, rooms_data
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     config = TEAMS_CONFIG[team_name]
 
     category = guild.get_channel(config["category_id"])
-    if not category:
-        await interaction.followup.send(f"❌ Erreur : Impossible de trouver la catégorie pour {team_name}. Vérifiez l'ID !", ephemeral=True)
+    if not category or not isinstance(category, discord.CategoryChannel):
+        await interaction.followup.send(f"❌ Impossible de trouver la catégorie pour {team_name}. Vérifiez l'ID !", ephemeral=True)
         return
+
+    # Supprime les anciens salons mémoires de cette équipe pour éviter les entrées obsolètes
+    to_delete = [ch_id for ch_id, d in rooms_data.items() if d["team"] == team_name]
+    for ch_id in to_delete:
+        del rooms_data[ch_id]
 
     role = discord.utils.get(guild.roles, name=team_name)
     if not role:
@@ -360,18 +357,23 @@ async def setup_team_helper(interaction: discord.Interaction, team_name: str):
             }
             channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
 
+        occupants = [
+            target.id for target, ow in channel.overwrites.items()
+            if isinstance(target, discord.Member) and not target.bot and ow.read_messages is True
+        ]
+
         rooms_data[channel.id] = {
             "name": channel_name,
             "team": team_name,
             "capacity": capacity,
-            "members": []
+            "members": occupants
         }
 
     embed = generate_dashboard_embed(guild, team_name)
     view = DashboardView(team_name)
     msg = await interaction.channel.send(embed=embed, view=view)
     dashboard_messages[team_name] = msg
-    await interaction.followup.send(f"✅ Tableau de bord pour l'équipe **{team_name}** créé avec succès !", ephemeral=True)
+    await interaction.followup.send(f"✅ Tableau de bord pour l'équipe **{team_name}** initialisé !", ephemeral=True)
 
 
 @bot.tree.command(name="setup_sangare", description="Crée le tableau de bord pour l'équipe Sangaré")
@@ -421,7 +423,7 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
     if not found_channel:
         for team_name, config in TEAMS_CONFIG.items():
             category = interaction.guild.get_channel(config["category_id"])
-            if category:
+            if category and isinstance(category, discord.CategoryChannel):
                 for ch in category.text_channels:
                     overwrites = ch.overwrites_for(membre)
                     if overwrites.read_messages is True:
