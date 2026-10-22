@@ -8,9 +8,12 @@ from discord.ui import View, Select, Button
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_LOG_CHANNEL_ID = int(os.getenv("ADMIN_LOG_CHANNEL_ID", 0))
 
-# --- IDS DES CATÉGORIES ---
+# --- IDS DES CATÉGORIES ET RÔLES ---
 CATEGORY_ROUGE_ID = 1541039212227465266  # Catégorie Sangaré
 CATEGORY_JAUNE_ID = 1541039252064833547  # Catégorie Muntari
+CATEGORY_REUNIFIE_ID = 1537440948697432064
+
+CANDIDAT_ROLE_ID = 1535332671499280525    # Rôle @candidats
 
 TEAMS_CONFIG = {
     "Sangaré": {
@@ -31,6 +34,16 @@ TEAMS_CONFIG = {
             "foret-jaune": 3,
             "plage-jaune": 4,
             "riviere-jaune": 5
+        }
+    },
+    "Réunification": {
+        "color": discord.Color.purple(),
+        "category_id": CATEGORY_REUNIFIE_ID,  # Si 0, réutilise la catégorie où la commande /setup est lancée
+        "rooms": {
+            "plage-reunifiee": 6,
+            "foret-reunifiee": 4,
+            "point-d-eau-reunifie": 3,
+            "conseil": 8
         }
     }
 }
@@ -76,7 +89,11 @@ async def restore_state_from_discord(bot_instance):
 
     for guild in bot_instance.guilds:
         for team_name, config in TEAMS_CONFIG.items():
-            category = guild.get_channel(config["category_id"])
+            cat_id = config["category_id"]
+            if not cat_id:
+                continue
+
+            category = guild.get_channel(cat_id)
             if not category or not isinstance(category, discord.CategoryChannel):
                 continue
 
@@ -135,9 +152,9 @@ async def send_room_control_panel(channel, guild):
     occupants_str = ", ".join(members_mentions) if members_mentions else "Personne"
 
     embed = discord.Embed(
-        title=f"📍 Lieu : {room_data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()}",
+        title=f"📍 Lieu : {room_data['name'].replace('-rouge', '').replace('-jaune', '').replace('-reunifiee', '').replace('-reunifie', '').capitalize()}",
         description=(
-            f"**Équipe :** {room_data['team']}\n"
+            f"**Camp/Équipe :** {room_data['team']}\n"
             f"**Présents :** {occupants_str}\n"
             f"**Capacité :** {len(room_data['members'])}/{room_data['capacity']}\n\n"
             "💬 Les messages sont effacés et archivés dès qu'un membre entre ou sort.\n"
@@ -149,10 +166,10 @@ async def send_room_control_panel(channel, guild):
 
 
 def generate_dashboard_embed(guild, team_name):
-    """Génère l'embed pour l'équipe sélectionnée."""
+    """Génère l'embed pour le camp/l'équipe sélectionnée."""
     team_info = TEAMS_CONFIG[team_name]
     embed = discord.Embed(
-        title=f"🗺️ Lieux de Rencontre — Équipe {team_name}",
+        title=f"🗺️ Lieux de Rencontre — {team_name}",
         description=(
             "Sélectionnez un lieu ci-dessous pour vous y déplacer.\n"
             "Si vous êtes déjà dans un salon, vous changerez automatiquement de pièce.\n"
@@ -168,7 +185,7 @@ def generate_dashboard_embed(guild, team_name):
                 members_mentions = [guild.get_member(m_id).mention for m_id in data["members"] if guild.get_member(m_id)]
                 occupants_str = "\n".join(members_mentions) if members_mentions else "*Personne sur place*"
                 status_icon = "🔴" if len(data["members"]) >= data["capacity"] else "🟢"
-                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').replace('-reunifiee', '').replace('-reunifie', '').capitalize()
 
                 embed.add_field(
                     name=f"{status_icon} {clean_name} ({len(data['members'])}/{data['capacity']})",
@@ -179,7 +196,7 @@ def generate_dashboard_embed(guild, team_name):
 
 
 async def refresh_dashboard_team(guild, team_name):
-    """Met à jour le tableau de bord d'une équipe."""
+    """Met à jour le tableau de bord d'une équipe ou du camp réunifié."""
     message = dashboard_messages.get(team_name)
     if message:
         try:
@@ -251,7 +268,7 @@ class DashboardView(View):
             if data["team"] == team_name:
                 nb = len(data["members"])
                 cap = data["capacity"]
-                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+                clean_name = data['name'].replace('-rouge', '').replace('-jaune', '').replace('-reunifiee', '').replace('-reunifie', '').capitalize()
 
                 options.append(discord.SelectOption(
                     label=f"{clean_name} ({nb}/{cap})",
@@ -293,10 +310,18 @@ class DashboardView(View):
         target_room = rooms_data[target_channel_id]
         target_channel = guild.get_channel(target_channel_id)
 
-        user_roles_names = [role.name for role in user.roles]
-        if target_room["team"] not in user_roles_names:
-            await interaction.followup.send(f"⛔ Vous devez avoir le rôle **{target_room['team']}** pour utiliser ceci !", ephemeral=True)
+        # 1. Vérification du rôle @Candidat pour tous
+        candidat_role = guild.get_role(CANDIDAT_ROLE_ID)
+        if candidat_role and candidat_role not in user.roles:
+            await interaction.followup.send("⛔ Seuls les membres ayant le rôle **Candidat** peuvent rejoindre ces lieux.", ephemeral=True)
             return
+
+        # 2. Vérification du rôle d'équipe (sauf pour la réunification où seule l'appartenance au rôle candidat suffit)
+        if target_room["team"] != "Réunification":
+            user_roles_names = [role.name for role in user.roles]
+            if target_room["team"] not in user_roles_names:
+                await interaction.followup.send(f"⛔ Vous devez avoir le rôle **{target_room['team']}** pour utiliser ceci !", ephemeral=True)
+                return
 
         if user.id in target_room["members"]:
             await interaction.followup.send("ℹ️ Vous êtes déjà dans ce lieu.", ephemeral=True)
@@ -316,7 +341,7 @@ class DashboardView(View):
         target_room["members"].append(user.id)
         await target_channel.set_permissions(user, read_messages=True, send_messages=True, read_message_history=True)
 
-        clean_name = target_room['name'].replace('-rouge', '').replace('-jaune', '').capitalize()
+        clean_name = target_room['name'].replace('-rouge', '').replace('-jaune', '').replace('-reunifiee', '').replace('-reunifie', '').capitalize()
         await interaction.followup.send(f"✅ Direction **{clean_name}** ! {target_channel.mention}", ephemeral=True)
         await send_room_control_panel(target_channel, guild)
         await refresh_dashboard_team(guild, target_room["team"])
@@ -333,28 +358,36 @@ async def setup_team_helper(interaction: discord.Interaction, team_name: str):
     guild = interaction.guild
     config = TEAMS_CONFIG[team_name]
 
-    category = guild.get_channel(config["category_id"])
+    # Détermination de la catégorie cible
+    cat_id = config["category_id"]
+    category = guild.get_channel(cat_id) if cat_id else interaction.channel.category
+    
     if not category or not isinstance(category, discord.CategoryChannel):
-        await interaction.followup.send(f"❌ Impossible de trouver la catégorie pour {team_name}. Vérifiez l'ID !", ephemeral=True)
+        await interaction.followup.send(f"❌ Impossible de trouver la catégorie pour {team_name}. Lancez la commande directement dans la catégorie voulue ou configurez un ID valide !", ephemeral=True)
         return
 
-    # Supprime les anciens salons mémoires de cette équipe pour éviter les entrées obsolètes
+    TEAMS_CONFIG[team_name]["category_id"] = category.id
+
+    # Nettoyage des anciens salons en mémoire pour ce camp
     to_delete = [ch_id for ch_id, d in rooms_data.items() if d["team"] == team_name]
     for ch_id in to_delete:
         del rooms_data[ch_id]
 
-    role = discord.utils.get(guild.roles, name=team_name)
-    if not role:
-        role = await guild.create_role(name=team_name, color=config["color"])
+    candidat_role = guild.get_role(CANDIDAT_ROLE_ID)
+    team_role = discord.utils.get(guild.roles, name=team_name)
 
     for channel_name, capacity in config["rooms"].items():
         channel = discord.utils.get(category.text_channels, name=channel_name)
         if not channel:
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                role: discord.PermissionOverwrite(read_messages=False),
                 guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
             }
+            if candidat_role:
+                overwrites[candidat_role] = discord.PermissionOverwrite(read_messages=False)
+            if team_role:
+                overwrites[team_role] = discord.PermissionOverwrite(read_messages=False)
+
             channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
 
         occupants = [
@@ -373,7 +406,7 @@ async def setup_team_helper(interaction: discord.Interaction, team_name: str):
     view = DashboardView(team_name)
     msg = await interaction.channel.send(embed=embed, view=view)
     dashboard_messages[team_name] = msg
-    await interaction.followup.send(f"✅ Tableau de bord pour l'équipe **{team_name}** initialisé !", ephemeral=True)
+    await interaction.followup.send(f"✅ Tableau de bord pour **{team_name}** initialisé !", ephemeral=True)
 
 
 @bot.tree.command(name="setup_sangare", description="Crée le tableau de bord pour l'équipe Sangaré")
@@ -386,6 +419,12 @@ async def slash_setup_sangare(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def slash_setup_muntari(interaction: discord.Interaction):
     await setup_team_helper(interaction, "Muntari")
+
+
+@bot.tree.command(name="setup_reunification", description="Crée le tableau de bord pour la Réunification")
+@app_commands.default_permissions(administrator=True)
+async def slash_setup_reunification(interaction: discord.Interaction):
+    await setup_team_helper(interaction, "Réunification")
 
 
 @bot.tree.command(name="quitter", description="Quitter votre salon secret actuel")
@@ -422,6 +461,8 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
 
     if not found_channel:
         for team_name, config in TEAMS_CONFIG.items():
+            if not config["category_id"]:
+                continue
             category = interaction.guild.get_channel(config["category_id"])
             if category and isinstance(category, discord.CategoryChannel):
                 for ch in category.text_channels:
@@ -437,7 +478,7 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
         await interaction.followup.send(f"❌ {membre.mention} n'a accès à aucun salon secret actuellement.", ephemeral=True)
         return
 
-    clean_name = found_room_name.replace("-rouge", "").replace("-jaune", "").capitalize()
+    clean_name = found_room_name.replace("-rouge", "").replace("-jaune", "").replace("-reunifiee", "").replace("-reunifie", "").capitalize()
     await archive_and_purge(found_channel, interaction.guild, f"{membre.name} a été EXPULSÉ de {clean_name}")
     await found_channel.set_permissions(membre, overwrite=None)
 
