@@ -43,7 +43,7 @@ TEAMS_CONFIG = {
             "plage-reunifiee": 6,
             "foret-reunifiee": 4,
             "point-d-eau-reunifie": 3,
-            "conseil": 8
+            "riviere-reunifie": 8
         }
     }
 }
