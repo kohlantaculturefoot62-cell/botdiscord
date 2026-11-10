@@ -1,5 +1,10 @@
 import os
 import io
+import json
+import random
+import asyncio
+import datetime
+import unicodedata
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -14,6 +19,10 @@ CATEGORY_JAUNE_ID = 1541039252064833547  # Catégorie Muntari
 CATEGORY_REUNIFIE_ID = 1537440948697432064
 
 CANDIDAT_ROLE_ID = 1535332671499280525    # Rôle @candidats
+
+# Rôle @spectateurs : mets son ID ici, ou dans la variable d'environnement SPECTATEUR_ROLE_ID.
+# Si l'ID vaut 0, le bot cherche un rôle dont le nom contient "spectateur".
+SPECTATEUR_ROLE_ID = int(os.getenv("SPECTATEUR_ROLE_ID", 0))
 
 TEAMS_CONFIG = {
     "Sangaré": {
@@ -50,6 +59,13 @@ TEAMS_CONFIG = {
 
 rooms_data = {}
 dashboard_messages = {}
+
+# Catégories (salons secrets) JAMAIS utilisées pour les citations du jeu "Qui a dit ça ?"
+QUOTE_EXCLUDED_CATEGORY_IDS = {CATEGORY_ROUGE_ID, CATEGORY_JAUNE_ID, CATEGORY_REUNIFIE_ID}
+
+# Fichier qui mémorise les phrases déjà utilisées (pour ne jamais les répéter)
+USED_QUOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "used_quotes.json")
+
 
 class KohLantaBot(commands.Bot):
     def __init__(self):
@@ -361,7 +377,7 @@ async def setup_team_helper(interaction: discord.Interaction, team_name: str):
     # Détermination de la catégorie cible
     cat_id = config["category_id"]
     category = guild.get_channel(cat_id) if cat_id else interaction.channel.category
-    
+
     if not category or not isinstance(category, discord.CategoryChannel):
         await interaction.followup.send(f"❌ Impossible de trouver la catégorie pour {team_name}. Lancez la commande directement dans la catégorie voulue ou configurez un ID valide !", ephemeral=True)
         return
@@ -497,6 +513,660 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
         await membre.send(f"⏳ Vous avez été retiré(e) du salon **{clean_name}** par l'arbitre.")
     except discord.Forbidden:
         pass
+
+
+# ==========================================================
+# 🎮 MINI-JEUX
+# ==========================================================
+# /jeux        : liste des jeux
+# /totem       : devine le nombre secret (plus haut / plus bas)
+# /qui_a_dit   : devine qui a écrit une phrase tirée de salons au hasard
+# /qui_a_dit_spectateurs : idem, avec tous les salons visibles par les spectateurs
+# /rapidite    : le premier à cliquer sur le bouton gagne
+# /anagramme   : remets les lettres dans l'ordre
+# /duel        : pierre-feuille-machette entre deux joueurs
+# /reset_citations : (admin) remet à zéro les phrases déjà utilisées
+# ==========================================================
+
+# Salons où une partie est déjà en cours (évite les parties qui se chevauchent)
+parties_en_cours = set()
+
+
+def normaliser(texte: str) -> str:
+    """Minuscule, sans accents, sans espaces autour : pour comparer des mots."""
+    texte = unicodedata.normalize("NFD", texte.strip().lower())
+    return "".join(c for c in texte if unicodedata.category(c) != "Mn")
+
+
+def format_scores(scores: dict) -> str:
+    """Classement lisible à partir de {user_id: points}."""
+    if not scores:
+        return "*Personne n'a marqué de point.*"
+    medailles = ["🥇", "🥈", "🥉"]
+    classement = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    lignes = []
+    for i, (uid, pts) in enumerate(classement):
+        icone = medailles[i] if i < 3 else "▫️"
+        lignes.append(f"{icone} <@{uid}> — **{pts}** pt(s)")
+    return "\n".join(lignes)
+
+
+async def reserver_salon(interaction: discord.Interaction) -> bool:
+    """Réserve le salon pour une partie. Renvoie False (et répond) s'il est déjà pris."""
+    if interaction.channel.id in parties_en_cours:
+        await interaction.response.send_message("⛔ Une partie est déjà en cours dans ce salon !", ephemeral=True)
+        return False
+    parties_en_cours.add(interaction.channel.id)
+    return True
+
+
+@bot.tree.command(name="jeux", description="Affiche la liste des mini-jeux disponibles")
+async def slash_jeux(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎮 Mini-jeux du camp",
+        description=(
+            "🗿 `/totem` — Devine le nombre secret avant les autres\n"
+            "🕵️ `/qui_a_dit` — Qui a dit cette phrase ? (citations tirées des salons)\n"
+            "👁️ `/qui_a_dit_spectateurs` — Idem, mais avec les salons secrets (réservé aux spectateurs)\n"
+            "⚡ `/rapidite` — Le plus rapide à cliquer gagne\n"
+            "🔤 `/anagramme` — Remets les lettres dans l'ordre\n"
+            "⚔️ `/duel` — Pierre-Feuille-Machette contre un autre joueur"
+        ),
+        color=discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# ------------------------------------------
+# 🗿 LE TOTEM MAUDIT
+# ------------------------------------------
+
+@bot.tree.command(name="totem", description="🗿 Le Totem Maudit : devinez le nombre secret avant les autres !")
+@app_commands.describe(maximum="Le nombre secret est entre 1 et ce maximum (défaut : 100)")
+async def slash_totem(interaction: discord.Interaction, maximum: app_commands.Range[int, 10, 1000] = 100):
+    if not await reserver_salon(interaction):
+        return
+
+    channel = interaction.channel
+    secret = random.randint(1, maximum)
+    duree = 90
+    essais = {}
+
+    embed = discord.Embed(
+        title="🗿 LE TOTEM MAUDIT",
+        description=(
+            f"Un nombre secret est caché entre **1 et {maximum}**.\n"
+            "Tapez simplement un nombre dans le salon !\n"
+            "Je vous dirai **plus haut** ⬆️ ou **plus bas** ⬇️.\n\n"
+            f"⏳ Vous avez **{duree} secondes**. Le premier à trouver gagne l'immunité ! 🔥"
+        ),
+        color=discord.Color.dark_orange()
+    )
+    await interaction.response.send_message(embed=embed)
+
+    loop = asyncio.get_running_loop()
+    fin = loop.time() + duree
+    gagnant = None
+
+    def check(m):
+        return m.channel.id == channel.id and not m.author.bot and m.content.strip().isdigit()
+
+    try:
+        while True:
+            reste = fin - loop.time()
+            if reste <= 0:
+                break
+            try:
+                msg = await bot.wait_for("message", check=check, timeout=reste)
+            except asyncio.TimeoutError:
+                break
+
+            guess = int(msg.content.strip())
+            essais[msg.author.id] = essais.get(msg.author.id, 0) + 1
+
+            if guess == secret:
+                gagnant = msg.author
+                break
+            elif guess < secret:
+                await msg.reply("⬆️ **Plus haut !**", mention_author=False)
+            else:
+                await msg.reply("⬇️ **Plus bas !**", mention_author=False)
+    finally:
+        parties_en_cours.discard(channel.id)
+
+    if gagnant:
+        result = discord.Embed(
+            title="🏆 LE TOTEM EST TROUVÉ !",
+            description=f"{gagnant.mention} a trouvé **{secret}** en **{essais[gagnant.id]}** essai(s) !\n🔥 Immunité (virtuelle) pour toi !",
+            color=discord.Color.green()
+        )
+    else:
+        result = discord.Embed(
+            title="💀 Le totem reste maudit...",
+            description=f"Personne n'a trouvé. Le nombre était **{secret}**.",
+            color=discord.Color.dark_red()
+        )
+    await channel.send(embed=result)
+
+
+# ------------------------------------------
+# 🕵️ QUI A DIT ÇA ?
+# ------------------------------------------
+
+def load_used_quotes() -> set:
+    try:
+        with open(USED_QUOTES_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_used_quotes(used: set):
+    try:
+        with open(USED_QUOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(used), f)
+    except OSError as e:
+        print(f"⚠️ Impossible de sauvegarder les citations utilisées : {e}")
+
+
+used_quotes = load_used_quotes()
+
+
+def is_valid_quote(msg: discord.Message, candidat_role) -> bool:
+    """Une phrase est utilisable si elle vient d'un candidat, est lisible et jamais utilisée."""
+    if msg.author.bot or msg.id in used_quotes:
+        return False
+    if not isinstance(msg.author, discord.Member) or candidat_role not in msg.author.roles:
+        return False
+    text = msg.content.strip()
+    if not (15 <= len(text) <= 250):
+        return False
+    if "http" in text.lower() or "@" in text or msg.mentions or msg.attachments:
+        return False
+    if text.startswith(("/", "!", "?", ".")):
+        return False
+    return True
+
+
+def get_spectateur_role(guild):
+    """Retrouve le rôle spectateurs (par ID, sinon par nom)."""
+    if SPECTATEUR_ROLE_ID:
+        return guild.get_role(SPECTATEUR_ROLE_ID)
+    for role in guild.roles:
+        if "spectateur" in normaliser(role.name):
+            return role
+    return None
+
+
+def quote_channels(guild, candidat_role, only_channel=None, access_role=None):
+    """Salons autorisés pour piocher une phrase.
+
+    Mode normal (access_role=None) : jamais les salons secrets ni le salon admin,
+    uniquement les salons visibles par les candidats.
+    Mode spectateurs (access_role=rôle) : tous les salons que ce rôle peut voir
+    (salons secrets inclus), et seulement ceux-là.
+    """
+    if only_channel:
+        return [only_channel]
+    result = []
+    for ch in guild.text_channels:
+        if access_role is None:
+            if ch.category_id in QUOTE_EXCLUDED_CATEGORY_IDS or ch.id == ADMIN_LOG_CHANNEL_ID:
+                continue
+            # Uniquement les salons visibles par les candidats (évite de citer des salons privés/staff)
+            if not ch.permissions_for(candidat_role).read_messages:
+                continue
+        else:
+            # Uniquement les salons auxquels les spectateurs ont accès
+            if not ch.permissions_for(access_role).read_messages:
+                continue
+        perms = ch.permissions_for(guild.me)
+        if perms.read_messages and perms.read_message_history:
+            result.append(ch)
+    return result
+
+
+async def pick_quote(guild, candidat_role, only_channel=None, access_role=None):
+    """Choisit une phrase au hasard dans un salon au hasard, à une date au hasard."""
+    channels = quote_channels(guild, candidat_role, only_channel, access_role)
+    random.shuffle(channels)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    for ch in channels[:25]:
+        start = ch.created_at
+        span = (now - start).total_seconds()
+        # Plusieurs tentatives à des dates différentes dans le même salon
+        for _ in range(3):
+            random_date = start + datetime.timedelta(seconds=random.random() * span)
+            try:
+                batch = [m async for m in ch.history(limit=100, after=random_date)]
+            except (discord.Forbidden, discord.HTTPException):
+                break
+            valid = [m for m in batch if is_valid_quote(m, candidat_role)]
+            if valid:
+                return random.choice(valid)
+    return None
+
+
+class QuiADitView(View):
+    def __init__(self, options_members, voter_role=None):
+        super().__init__(timeout=None)
+        self.votes = {}
+        self.voter_role = voter_role  # si défini, seuls les membres avec ce rôle peuvent voter
+
+        options = [
+            discord.SelectOption(label=m.display_name[:100], value=str(m.id))
+            for m in options_members
+        ]
+        self.select = Select(placeholder="👤 Qui a dit ça ?", options=options)
+        self.select.callback = self.on_vote
+        self.add_item(self.select)
+
+    async def on_vote(self, interaction: discord.Interaction):
+        if self.voter_role and self.voter_role not in getattr(interaction.user, "roles", []):
+            await interaction.response.send_message(
+                f"⛔ Seuls les membres **{self.voter_role.name}** peuvent voter ici.", ephemeral=True
+            )
+            return
+        self.votes[interaction.user.id] = int(interaction.data["values"][0])
+        await interaction.response.send_message(
+            "🗳️ Vote enregistré ! Tu peux le changer jusqu'à la fin du temps imparti.", ephemeral=True
+        )
+
+
+async def lancer_qui_a_dit(interaction: discord.Interaction, manches: int, temps: int, salon, spectateurs: bool):
+    """Moteur commun de /qui_a_dit (normal) et /qui_a_dit_spectateurs (accès à tout ce que voient les spectateurs)."""
+    guild = interaction.guild
+    candidat_role = guild.get_role(CANDIDAT_ROLE_ID)
+    if not candidat_role:
+        await interaction.response.send_message("❌ Rôle candidat introuvable.", ephemeral=True)
+        return
+
+    spectateur_role = None
+    if spectateurs:
+        spectateur_role = get_spectateur_role(guild)
+        if not spectateur_role:
+            await interaction.response.send_message(
+                "❌ Rôle spectateurs introuvable. Renseigne `SPECTATEUR_ROLE_ID` dans le code ou les variables d'environnement.",
+                ephemeral=True
+            )
+            return
+        # Réservé aux spectateurs (le contenu des salons secrets ne doit pas fuiter vers les candidats)
+        if spectateur_role not in interaction.user.roles:
+            await interaction.response.send_message("⛔ Ce jeu est réservé aux **spectateurs**.", ephemeral=True)
+            return
+        # Le jeu ne doit pas se lancer dans un salon lisible par les candidats
+        if interaction.channel.permissions_for(candidat_role).read_messages:
+            await interaction.response.send_message(
+                "⛔ Lance ce jeu dans un salon que les candidats ne peuvent pas voir (salon des spectateurs).",
+                ephemeral=True
+            )
+            return
+        if salon and not salon.permissions_for(spectateur_role).read_messages:
+            await interaction.response.send_message("⛔ Les spectateurs n'ont pas accès à ce salon.", ephemeral=True)
+            return
+    else:
+        # Si un salon précis est demandé, il ne doit pas être secret
+        if salon and (salon.category_id in QUOTE_EXCLUDED_CATEGORY_IDS or salon.id == ADMIN_LOG_CHANNEL_ID):
+            await interaction.response.send_message("⛔ Ce salon ne peut pas être utilisé pour ce jeu.", ephemeral=True)
+            return
+
+    candidats = [m for m in candidat_role.members if not m.bot]
+    if len(candidats) < 4:
+        await interaction.response.send_message("❌ Pas assez de candidats pour jouer.", ephemeral=True)
+        return
+
+    if not await reserver_salon(interaction):
+        return
+
+    titre_jeu = "QUI A DIT ÇA ? (SPECTATEURS)" if spectateurs else "QUI A DIT ÇA ?"
+    await interaction.response.send_message(
+        f"🕵️ **{titre_jeu}** — {manches} manche(s), {temps}s pour voter à chaque fois.\n"
+        "Je cherche des phrases dans les salons du serveur... 🔎"
+    )
+
+    channel = interaction.channel
+    scores = {}
+    manches_jouees = 0
+
+    try:
+        for numero in range(1, manches + 1):
+            quote = await pick_quote(guild, candidat_role, salon, spectateur_role)
+            if not quote:
+                await channel.send("😕 Je n'ai plus de nouvelle phrase à te proposer pour l'instant.")
+                break
+
+            used_quotes.add(quote.id)
+            save_used_quotes(used_quotes)
+
+            auteur = quote.author
+            autres = [m for m in candidats if m.id != auteur.id]
+            choix = random.sample(autres, min(9, len(autres))) + [auteur]
+            random.shuffle(choix)
+
+            view = QuiADitView(choix, voter_role=spectateur_role)
+            embed = discord.Embed(
+                title=f"🕵️ Manche {numero}/{manches} — Qui a dit ça ?",
+                description=f"> {discord.utils.escape_mentions(quote.content.strip())}\n\n⏳ **{temps} secondes** pour voter !",
+                color=discord.Color.blurple()
+            )
+            msg = await channel.send(embed=embed, view=view)
+            await asyncio.sleep(temps)
+
+            view.select.disabled = True
+            try:
+                await msg.edit(view=view)
+            except discord.HTTPException:
+                pass
+
+            bons = [uid for uid, vote in view.votes.items() if vote == auteur.id]
+            for uid in bons:
+                scores[uid] = scores.get(uid, 0) + 1
+
+            gagnants_txt = ", ".join(f"<@{uid}>" for uid in bons) if bons else "*Personne*"
+            reveal = discord.Embed(
+                title="🎭 Réponse",
+                description=(
+                    f"C'était **{auteur.display_name}** ({auteur.mention}) !\n"
+                    f"📍 Dans {quote.channel.mention} — [voir le message]({quote.jump_url})\n\n"
+                    f"✅ Bonne réponse : {gagnants_txt}"
+                ),
+                color=discord.Color.green() if bons else discord.Color.red()
+            )
+            await channel.send(embed=reveal)
+            manches_jouees += 1
+            await asyncio.sleep(3)
+    finally:
+        parties_en_cours.discard(channel.id)
+
+    if manches_jouees:
+        await channel.send(embed=discord.Embed(
+            title="🏆 Classement final — Qui a dit ça ?",
+            description=format_scores(scores),
+            color=discord.Color.gold()
+        ))
+
+
+@bot.tree.command(name="qui_a_dit", description="🕵️ Devine qui a prononcé une phrase tirée des salons du serveur")
+@app_commands.describe(
+    manches="Nombre de phrases (défaut : 3)",
+    temps="Secondes pour voter à chaque manche (défaut : 30)",
+    salon="Piocher uniquement dans ce salon (optionnel)"
+)
+async def slash_qui_a_dit(
+    interaction: discord.Interaction,
+    manches: app_commands.Range[int, 1, 10] = 3,
+    temps: app_commands.Range[int, 10, 120] = 30,
+    salon: discord.TextChannel = None
+):
+    await lancer_qui_a_dit(interaction, manches, temps, salon, spectateurs=False)
+
+
+@bot.tree.command(name="qui_a_dit_spectateurs", description="👁️ Qui a dit ça ? Version spectateurs : phrases de tous les salons que les spectateurs voient")
+@app_commands.describe(
+    manches="Nombre de phrases (défaut : 3)",
+    temps="Secondes pour voter à chaque manche (défaut : 30)",
+    salon="Piocher uniquement dans ce salon (optionnel)"
+)
+async def slash_qui_a_dit_spectateurs(
+    interaction: discord.Interaction,
+    manches: app_commands.Range[int, 1, 10] = 3,
+    temps: app_commands.Range[int, 10, 120] = 30,
+    salon: discord.TextChannel = None
+):
+    await lancer_qui_a_dit(interaction, manches, temps, salon, spectateurs=True)
+
+
+@bot.tree.command(name="reset_citations", description="Remet à zéro la liste des phrases déjà utilisées dans /qui_a_dit")
+@app_commands.default_permissions(administrator=True)
+async def slash_reset_citations(interaction: discord.Interaction):
+    used_quotes.clear()
+    save_used_quotes(used_quotes)
+    await interaction.response.send_message("♻️ Les phrases pourront de nouveau être tirées.", ephemeral=True)
+
+
+# ------------------------------------------
+# ⚡ ÉPREUVE DE RAPIDITÉ
+# ------------------------------------------
+
+class RapiditeView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.winner = None
+        self.start = None
+        self.event = asyncio.Event()
+        self.elapsed = None
+
+        self.btn = Button(label="⏳ Attends...", style=discord.ButtonStyle.secondary, disabled=True)
+        self.btn.callback = self.on_click
+        self.add_item(self.btn)
+
+    async def on_click(self, interaction: discord.Interaction):
+        if self.winner or self.start is None:
+            await interaction.response.defer()
+            return
+        self.winner = interaction.user
+        self.elapsed = asyncio.get_running_loop().time() - self.start
+        self.btn.disabled = True
+        self.btn.label = f"🏆 {interaction.user.display_name}"
+        self.btn.style = discord.ButtonStyle.success
+        await interaction.response.edit_message(view=self)
+        self.event.set()
+
+
+@bot.tree.command(name="rapidite", description="⚡ Épreuve de rapidité : le plus rapide à cliquer gagne !")
+@app_commands.describe(manches="Nombre de manches (défaut : 3)")
+async def slash_rapidite(interaction: discord.Interaction, manches: app_commands.Range[int, 1, 10] = 3):
+    if not await reserver_salon(interaction):
+        return
+
+    channel = interaction.channel
+    scores = {}
+    await interaction.response.send_message(
+        f"⚡ **ÉPREUVE DE RAPIDITÉ** — {manches} manche(s) ! Quand le bouton devient vert, cliquez le plus vite possible !"
+    )
+
+    try:
+        for numero in range(1, manches + 1):
+            await asyncio.sleep(2)
+            view = RapiditeView()
+            msg = await channel.send(f"🔥 **Manche {numero}/{manches}** — Préparez-vous...", view=view)
+
+            await asyncio.sleep(random.uniform(3, 9))
+
+            view.btn.disabled = False
+            view.btn.label = "🔥 CLIQUE !"
+            view.btn.style = discord.ButtonStyle.danger
+            view.start = asyncio.get_running_loop().time()
+            await msg.edit(content=f"🔥 **Manche {numero}/{manches}** — **GO !**", view=view)
+
+            try:
+                await asyncio.wait_for(view.event.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                view.btn.disabled = True
+                view.btn.label = "💤 Trop tard"
+                await msg.edit(content=f"💤 **Manche {numero}/{manches}** — Personne n'a réagi.", view=view)
+                continue
+
+            scores[view.winner.id] = scores.get(view.winner.id, 0) + 1
+            await msg.edit(
+                content=f"🏆 **Manche {numero}/{manches}** — {view.winner.mention} gagne en **{int(view.elapsed * 1000)} ms** !"
+            )
+    finally:
+        parties_en_cours.discard(channel.id)
+
+    await channel.send(embed=discord.Embed(
+        title="🏆 Classement — Rapidité",
+        description=format_scores(scores),
+        color=discord.Color.gold()
+    ))
+
+
+# ------------------------------------------
+# 🔤 ANAGRAMME
+# ------------------------------------------
+
+MOTS_ANAGRAMME = [
+    "machette", "collier", "immunite", "conseil", "aventurier", "bivouac", "radeau", "cocotier",
+    "totem", "tribu", "idole", "epreuve", "reunification", "pirogue", "naufrage", "campement",
+    "feu", "braises", "allumette", "poisson", "banane", "noix", "coco", "jungle", "plage", "foret",
+    "riviere", "marmite", "hamac", "boussole", "carte", "oasis", "lagon", "rocher", "falaise",
+    "strategie", "alliance", "trahison", "vote", "jury", "finale", "poteaux", "equilibre", "orientation",
+    "survie", "faim", "soif", "moustique", "orage", "tempete", "cabane", "bambou", "liane", "sable",
+    "recif", "mangrove", "volcan", "ananas", "cascade", "sentier", "tresor", "indice", "avantage",
+]
+mots_utilises = set()
+
+
+def tirer_mot() -> str:
+    global mots_utilises
+    disponibles = [m for m in MOTS_ANAGRAMME if m not in mots_utilises]
+    if not disponibles:
+        mots_utilises = set()
+        disponibles = list(MOTS_ANAGRAMME)
+    mot = random.choice(disponibles)
+    mots_utilises.add(mot)
+    return mot
+
+
+def melanger(mot: str) -> str:
+    lettres = list(mot)
+    for _ in range(20):
+        random.shuffle(lettres)
+        if "".join(lettres) != mot:
+            break
+    return "".join(lettres)
+
+
+@bot.tree.command(name="anagramme", description="🔤 Remets les lettres dans l'ordre pour trouver le mot !")
+@app_commands.describe(manches="Nombre de mots (défaut : 5)")
+async def slash_anagramme(interaction: discord.Interaction, manches: app_commands.Range[int, 1, 15] = 5):
+    if not await reserver_salon(interaction):
+        return
+
+    channel = interaction.channel
+    scores = {}
+    await interaction.response.send_message(
+        f"🔤 **ANAGRAMME** — {manches} mot(s) à retrouver ! Écrivez la réponse directement dans le salon (20 secondes par mot)."
+    )
+
+    try:
+        for numero in range(1, manches + 1):
+            await asyncio.sleep(2)
+            mot = tirer_mot()
+            melange = melanger(mot)
+            await channel.send(embed=discord.Embed(
+                title=f"🔤 Mot {numero}/{manches}",
+                description=f"# {' '.join(melange.upper())}\n*({len(mot)} lettres)*",
+                color=discord.Color.teal()
+            ))
+
+            loop = asyncio.get_running_loop()
+            fin = loop.time() + 20
+            gagnant = None
+
+            def check(m):
+                return m.channel.id == channel.id and not m.author.bot and normaliser(m.content) == mot
+
+            try:
+                msg = await bot.wait_for("message", check=check, timeout=20)
+                gagnant = msg.author
+                await msg.add_reaction("✅")
+            except asyncio.TimeoutError:
+                pass
+
+            if gagnant:
+                scores[gagnant.id] = scores.get(gagnant.id, 0) + 1
+                await channel.send(f"✅ {gagnant.mention} trouve **{mot.upper()}** !")
+            else:
+                await channel.send(f"⌛ Temps écoulé ! Le mot était **{mot.upper()}**.")
+    finally:
+        parties_en_cours.discard(channel.id)
+
+    await channel.send(embed=discord.Embed(
+        title="🏆 Classement — Anagramme",
+        description=format_scores(scores),
+        color=discord.Color.gold()
+    ))
+
+
+# ------------------------------------------
+# ⚔️ DUEL : PIERRE - FEUILLE - MACHETTE
+# ------------------------------------------
+
+DUEL_EMOJIS = {"pierre": "🪨 Pierre", "feuille": "🍃 Feuille", "machette": "🔪 Machette"}
+DUEL_BEATS = {"pierre": "machette", "machette": "feuille", "feuille": "pierre"}
+
+
+class DuelView(View):
+    def __init__(self, p1: discord.Member, p2: discord.Member):
+        super().__init__(timeout=None)
+        self.players = {p1.id: p1, p2.id: p2}
+        self.choices = {}
+        self.done = asyncio.Event()
+
+    async def _choose(self, interaction: discord.Interaction, choice: str):
+        uid = interaction.user.id
+        if uid not in self.players:
+            await interaction.response.send_message("⛔ Ce duel ne te concerne pas !", ephemeral=True)
+            return
+        if uid in self.choices:
+            await interaction.response.send_message("ℹ️ Tu as déjà fait ton choix.", ephemeral=True)
+            return
+        self.choices[uid] = choice
+        await interaction.response.send_message(f"✅ Tu as choisi **{DUEL_EMOJIS[choice]}**. En attente de l'adversaire...", ephemeral=True)
+        if len(self.choices) == 2:
+            self.done.set()
+
+    @discord.ui.button(label="🪨 Pierre", style=discord.ButtonStyle.secondary)
+    async def pierre(self, interaction: discord.Interaction, button: Button):
+        await self._choose(interaction, "pierre")
+
+    @discord.ui.button(label="🍃 Feuille", style=discord.ButtonStyle.success)
+    async def feuille(self, interaction: discord.Interaction, button: Button):
+        await self._choose(interaction, "feuille")
+
+    @discord.ui.button(label="🔪 Machette", style=discord.ButtonStyle.danger)
+    async def machette(self, interaction: discord.Interaction, button: Button):
+        await self._choose(interaction, "machette")
+
+
+@bot.tree.command(name="duel", description="⚔️ Défie un joueur à Pierre-Feuille-Machette")
+@app_commands.describe(adversaire="Le joueur à défier")
+async def slash_duel(interaction: discord.Interaction, adversaire: discord.Member):
+    if adversaire.bot or adversaire.id == interaction.user.id:
+        await interaction.response.send_message("❌ Choisis un autre joueur humain pour ton duel !", ephemeral=True)
+        return
+
+    p1, p2 = interaction.user, adversaire
+    view = DuelView(p1, p2)
+    await interaction.response.send_message(
+        f"⚔️ **DUEL** : {p1.mention} VS {p2.mention}\nChoisissez votre arme en secret (60 secondes) !",
+        view=view
+    )
+    msg = await interaction.original_response()
+
+    try:
+        await asyncio.wait_for(view.done.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        for child in view.children:
+            child.disabled = True
+        await msg.edit(content="⌛ Duel annulé : tout le monde n'a pas joué à temps.", view=view)
+        return
+
+    for child in view.children:
+        child.disabled = True
+
+    c1, c2 = view.choices[p1.id], view.choices[p2.id]
+    resume = f"{p1.mention} : **{DUEL_EMOJIS[c1]}**\n{p2.mention} : **{DUEL_EMOJIS[c2]}**\n\n"
+    if c1 == c2:
+        resume += "🤝 **Égalité !** Relancez un duel."
+    elif DUEL_BEATS[c1] == c2:
+        resume += f"🏆 **{p1.display_name}** remporte le duel !"
+    else:
+        resume += f"🏆 **{p2.display_name}** remporte le duel !"
+
+    await msg.edit(content=f"⚔️ **DUEL TERMINÉ**\n{resume}", view=view)
 
 
 bot.run(TOKEN)
