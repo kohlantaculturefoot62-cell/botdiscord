@@ -1211,7 +1211,7 @@ async def slash_duel(interaction: discord.Interaction, adversaire: discord.Membe
 # ------------------------------------------
 
 RECAP_CHANNEL_ID = 1545076756384579726
-GEMINI_API_KEY = os.getenv("API_KEY")  # ⚠️ À mettre dans les variables d'environnement, JAMAIS dans le code
+GEMINI_API_KEY = os.getenv("API-KEY")  # ⚠️ À mettre dans les variables d'environnement, JAMAIS dans le code
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 QUIZ_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz_questions.json")
 QUIZ_MIN_RESTANTES = 10   # sous ce seuil, le bot recharge des questions tout seul après une partie
