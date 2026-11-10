@@ -5,6 +5,7 @@ import random
 import asyncio
 import datetime
 import unicodedata
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -25,7 +26,7 @@ SPECTATEUR_ROLE_ID = 1535332731221967059  # Rôle @spectateurs
 
 # Rôle @orga : mets son ID ici, ou dans la variable d'environnement ORGA_ROLE_ID.
 # Si l'ID vaut 0, le bot cherche un rôle dont le nom contient "orga" (orga, organisateur, organisation...).
-ORGA_ROLE_ID = 1535332585671233676
+ORGA_ROLE_ID = int(os.getenv("ORGA_ROLE_ID", 0))
 
 TEAMS_CONFIG = {
     "Sangaré": {
@@ -525,6 +526,8 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
 # /totem       : devine le nombre secret (plus haut / plus bas)
 # /qui_a_dit   : devine qui a écrit une phrase tirée de salons au hasard
 # /qui_a_dit_spectateurs : idem, avec tous les salons visibles par les spectateurs
+# /quiz_aventure : questions sur l'aventure préparées à l'avance avec Gemini (depuis #recap-journee)
+# /quiz_preparer, /quiz_etat, /quiz_reset : (admin/orga) gestion des questions
 # /rapidite    : le premier à cliquer sur le bouton gagne
 # /anagramme   : remets les lettres dans l'ordre
 # /duel        : pierre-feuille-machette entre deux joueurs
@@ -571,6 +574,7 @@ async def slash_jeux(interaction: discord.Interaction):
             "🗿 `/totem` — Devine le nombre secret avant les autres\n"
             "🕵️ `/qui_a_dit` — Qui a dit cette phrase ? (citations tirées des salons)\n"
             "👁️ `/qui_a_dit_spectateurs` — Idem, mais avec les salons secrets (réservé aux spectateurs)\n"
+            "🧠 `/quiz_aventure` — Questions sur l'aventure (la réponse est toujours un candidat)\n"
             "⚡ `/rapidite` — Le plus rapide à cliquer gagne\n"
             "🔤 `/anagramme` — Remets les lettres dans l'ordre\n"
             "⚔️ `/duel` — Pierre-Feuille-Machette contre un autre joueur"
@@ -768,7 +772,7 @@ async def pick_quote(guild, candidat_role, only_channel=None, access_role=None):
 
 
 class QuiADitView(View):
-    def __init__(self, options_members, voter_role_ids=None):
+    def __init__(self, options_members, voter_role_ids=None, placeholder="👤 Qui a dit ça ?"):
         super().__init__(timeout=None)
         self.votes = {}
         # si défini, seuls ces rôles (et les admins/orgas) peuvent voter
@@ -778,7 +782,7 @@ class QuiADitView(View):
             discord.SelectOption(label=m.display_name[:100], value=str(m.id))
             for m in options_members
         ]
-        self.select = Select(placeholder="👤 Qui a dit ça ?", options=options)
+        self.select = Select(placeholder=placeholder, options=options)
         self.select.callback = self.on_vote
         self.add_item(self.select)
 
@@ -1198,6 +1202,398 @@ async def slash_duel(interaction: discord.Interaction, adversaire: discord.Membe
         resume += f"🏆 **{p2.display_name}** remporte le duel !"
 
     await msg.edit(content=f"⚔️ **DUEL TERMINÉ**\n{resume}", view=view)
+
+
+# ------------------------------------------
+# 🧠 QUIZ DE L'AVENTURE
+# Questions préparées à l'avance avec Gemini à partir du salon #recap-journee.
+# La réponse est toujours un candidat (ou ancien candidat).
+# ------------------------------------------
+
+RECAP_CHANNEL_ID = 1545076756384579726
+GEMINI_API_KEY = os.getenv("API_KEY")  # ⚠️ À mettre dans les variables d'environnement, JAMAIS dans le code
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+QUIZ_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz_questions.json")
+QUIZ_MIN_RESTANTES = 10   # sous ce seuil, le bot recharge des questions tout seul après une partie
+BLOC_MAX_CARACTERES = 30000
+
+quiz_lock = asyncio.Lock()
+
+
+def load_quiz() -> dict:
+    try:
+        with open(QUIZ_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data.setdefault("questions", [])
+    data.setdefault("last_recap_id", 0)
+    return data
+
+
+def save_quiz():
+    try:
+        with open(QUIZ_FILE, "w", encoding="utf-8") as f:
+            json.dump(quiz_data, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        print(f"⚠️ Impossible de sauvegarder les questions du quiz : {e}")
+
+
+quiz_data = load_quiz()
+
+
+def quiz_cle(question: str) -> str:
+    """Forme normalisée d'une question, pour détecter les doublons."""
+    texte = normaliser(question)
+    return "".join(c for c in texte if c.isalnum() or c == " ").strip()
+
+
+def quiz_restantes() -> int:
+    return sum(1 for q in quiz_data["questions"] if not q["used"])
+
+
+def recap_message_text(m: discord.Message):
+    """Texte d'un message du récap (contenu + embeds), avec l'heure."""
+    parts = []
+    if m.content.strip():
+        parts.append(m.content.strip())
+    for e in m.embeds:
+        if e.title:
+            parts.append(e.title)
+        if e.description:
+            parts.append(e.description)
+        for fld in e.fields:
+            parts.append(f"{fld.name} : {fld.value}")
+    texte = "\n".join(parts).strip()
+    if not texte:
+        return None
+    return f"[{m.created_at.astimezone().strftime('%d/%m %H:%M')}] {texte}"
+
+
+async def collect_recap(channel, after_id: int):
+    """Lit le salon récap et le découpe en blocs. Renvoie [(texte, id_du_dernier_message_du_bloc), ...]."""
+    kwargs = {"limit": None, "oldest_first": True}
+    if after_id:
+        kwargs["after"] = discord.Object(id=after_id)
+
+    blocs = []
+    courant = ""
+    dernier_id = after_id
+    async for m in channel.history(**kwargs):
+        txt = recap_message_text(m)
+        if not txt:
+            continue
+        if courant and len(courant) + len(txt) > BLOC_MAX_CARACTERES:
+            blocs.append((courant, dernier_id))
+            courant = ""
+        courant += txt + "\n\n"
+        dernier_id = m.id
+    if courant:
+        blocs.append((courant, dernier_id))
+    return blocs
+
+
+async def gemini_json(prompt: str):
+    """Appelle Gemini et renvoie le JSON décodé."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("La variable d'environnement GEMINI_API_KEY n'est pas définie.")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.8, "responseMimeType": "application/json"},
+    }
+
+    derniere_erreur = None
+    for tentative in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status != 200:
+                        message = (data.get("error", {}) or {}).get("message", "") if isinstance(data, dict) else ""
+                        raise RuntimeError(f"Gemini a répondu {resp.status} : {message[:200]}")
+            texte = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if texte.startswith("```"):
+                texte = texte.strip("`")
+                if texte.lower().startswith("json"):
+                    texte = texte[4:]
+            return json.loads(texte)
+        except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, KeyError, IndexError, json.JSONDecodeError) as e:
+            derniere_erreur = e
+            await asyncio.sleep(3 * (tentative + 1))
+    raise RuntimeError(f"Échec Gemini après 3 tentatives : {derniere_erreur}")
+
+
+def trouver_membre(nom: str, annuaire: dict):
+    """Retrouve le candidat correspondant au nom donné par Gemini."""
+    cle = normaliser(nom)
+    if cle in annuaire:
+        return annuaire[cle]
+    proches = {m.id: m for k, m in annuaire.items() if cle and (k.startswith(cle) or cle.startswith(k) or cle in k)}
+    if len(proches) == 1:
+        return next(iter(proches.values()))
+    return None
+
+
+async def generer_questions(bloc: str, noms: list, deja: list, n: int):
+    prompt = (
+        "Tu prépares un quiz pour un jeu de type Koh-Lanta qui se déroule sur Discord.\n"
+        "Voici le récapitulatif des journées de l'aventure (ordre chronologique) :\n\n"
+        f"=== RÉCAP ===\n{bloc}\n=== FIN DU RÉCAP ===\n\n"
+        f"Liste des participants (la réponse doit être EXACTEMENT l'un de ces noms) : {', '.join(noms)}\n\n"
+        f"Crée {n} questions de quiz basées UNIQUEMENT sur les informations du récap.\n"
+        "Règles :\n"
+        "- Chaque question commence par « Qui » et a pour réponse UN SEUL participant de la liste.\n"
+        "- La réponse doit être clairement vérifiable dans le récap, sans ambiguïté.\n"
+        "- La question ne doit pas contenir le nom de la réponse ni l'indiquer.\n"
+        "- Varie les sujets : épreuves, votes, alliances, conseils, stratégies, anecdotes, moments marquants.\n"
+        "- Questions courtes (une phrase), en français, ton amusant.\n"
+        "- N'invente rien qui ne soit pas dans le récap.\n"
+        + (f"- Ne repose pas ces questions déjà existantes : {json.dumps(deja[-80:], ensure_ascii=False)}\n" if deja else "")
+        + "\nRéponds uniquement par un tableau JSON d'objets de la forme "
+        '{"question": "...", "reponse": "nom exact", "explication": "une phrase qui justifie la réponse"}.'
+    )
+    data = await gemini_json(prompt)
+    if isinstance(data, dict):
+        data = data.get("questions", [])
+    return data if isinstance(data, list) else []
+
+
+async def preparer_questions(guild: discord.Guild, tout: bool = False, max_blocs: int = 5, par_bloc: int = 12):
+    """Lit le récap, génère des questions avec Gemini et les range dans le fichier. Renvoie (ajoutées, message)."""
+    channel = guild.get_channel(RECAP_CHANNEL_ID)
+    if not channel:
+        return 0, "❌ Salon #recap-journee introuvable (le bot y a-t-il accès ?)."
+
+    candidat_role = guild.get_role(CANDIDAT_ROLE_ID)
+    elimine_role = guild.get_role(ELIMINE_ROLE_ID)
+    membres = {}
+    for role in (candidat_role, elimine_role):
+        if role:
+            for m in role.members:
+                if not m.bot:
+                    membres[m.id] = m
+    if len(membres) < 4:
+        return 0, "❌ Pas assez de candidats trouvés."
+
+    annuaire = {}
+    for m in membres.values():
+        for nom in {m.display_name, m.name, getattr(m, "global_name", None)}:
+            if nom:
+                annuaire[normaliser(nom)] = m
+    noms = [m.display_name for m in membres.values()]
+
+    async with quiz_lock:
+        apres = 0 if tout else quiz_data["last_recap_id"]
+        try:
+            blocs = await collect_recap(channel, apres)
+        except discord.Forbidden:
+            return 0, "❌ Je n'ai pas la permission de lire #recap-journee."
+        if not blocs:
+            return 0, "ℹ️ Aucun nouveau message dans #recap-journee depuis la dernière préparation."
+
+        connues = {quiz_cle(q["question"]) for q in quiz_data["questions"]}
+        ajoutees = 0
+        erreur = None
+
+        for texte, dernier_id in blocs[:max_blocs]:
+            deja = [q["question"] for q in quiz_data["questions"]]
+            try:
+                brutes = await generer_questions(texte, noms, deja, par_bloc)
+            except RuntimeError as e:
+                erreur = str(e)
+                break
+
+            for item in brutes:
+                if not isinstance(item, dict):
+                    continue
+                question = str(item.get("question", "")).strip()
+                reponse = str(item.get("reponse", "")).strip()
+                if not question or not reponse:
+                    continue
+                cle = quiz_cle(question)
+                if cle in connues:
+                    continue
+                membre = trouver_membre(reponse, annuaire)
+                if not membre:
+                    continue
+                connues.add(cle)
+                quiz_data["questions"].append({
+                    "question": question,
+                    "answer_id": membre.id,
+                    "explication": str(item.get("explication", "")).strip(),
+                    "used": False,
+                })
+                ajoutees += 1
+
+            # On n'avance le marqueur "déjà lu" qu'après un bloc traité avec succès
+            if not tout:
+                quiz_data["last_recap_id"] = dernier_id
+            save_quiz()
+
+        if tout and not erreur:
+            quiz_data["last_recap_id"] = blocs[min(len(blocs), max_blocs) - 1][1]
+            save_quiz()
+
+        reste = len(blocs) - max_blocs
+        resume = f"✅ **{ajoutees}** nouvelle(s) question(s) ajoutée(s). Questions disponibles : **{quiz_restantes()}**."
+        if erreur:
+            resume += f"\n⚠️ Arrêt en cours de route : {erreur}"
+        if reste > 0 and not erreur:
+            resume += f"\nℹ️ Il reste encore {reste} bloc(s) du récap à traiter : relance la commande."
+        return ajoutees, resume
+
+
+async def recharge_silencieuse(guild: discord.Guild):
+    """Recharge des questions en arrière-plan quand il n'en reste plus beaucoup."""
+    try:
+        await preparer_questions(guild, tout=False, max_blocs=2)
+    except Exception as e:
+        print(f"⚠️ Recharge automatique du quiz impossible : {e}")
+
+
+@bot.tree.command(name="quiz_preparer", description="(Orga) Lit #recap-journee et prépare des questions avec Gemini")
+@app_commands.describe(
+    tout="Relire tout le récap depuis le début (sinon : seulement les nouveaux messages)",
+    blocs="Nombre maximum de blocs de récap à traiter (défaut : 5)"
+)
+async def slash_quiz_preparer(interaction: discord.Interaction, tout: bool = False, blocs: app_commands.Range[int, 1, 10] = 5):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Réservé aux admins et aux orgas.", ephemeral=True)
+        return
+    if quiz_lock.locked():
+        await interaction.response.send_message("⏳ Une préparation est déjà en cours.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    _, message = await preparer_questions(interaction.guild, tout=tout, max_blocs=blocs)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@bot.tree.command(name="quiz_etat", description="(Orga) Nombre de questions du quiz disponibles")
+async def slash_quiz_etat(interaction: discord.Interaction):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Réservé aux admins et aux orgas.", ephemeral=True)
+        return
+    total = len(quiz_data["questions"])
+    await interaction.response.send_message(
+        f"🧠 **{quiz_restantes()}** question(s) disponible(s) sur **{total}** préparée(s).", ephemeral=True
+    )
+
+
+@bot.tree.command(name="quiz_reset", description="(Orga) Remet toutes les questions du quiz comme non posées")
+async def slash_quiz_reset(interaction: discord.Interaction):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Réservé aux admins et aux orgas.", ephemeral=True)
+        return
+    for q in quiz_data["questions"]:
+        q["used"] = False
+    save_quiz()
+    await interaction.response.send_message("♻️ Toutes les questions pourront être reposées.", ephemeral=True)
+
+
+@bot.tree.command(name="quiz_aventure", description="🧠 Questions sur l'aventure : trouve le bon candidat !")
+@app_commands.describe(
+    questions="Nombre de questions (défaut : 5)",
+    temps="Secondes pour répondre à chaque question (défaut : 20)"
+)
+async def slash_quiz_aventure(
+    interaction: discord.Interaction,
+    questions: app_commands.Range[int, 1, 15] = 5,
+    temps: app_commands.Range[int, 10, 60] = 20
+):
+    guild = interaction.guild
+    dispo = [q for q in quiz_data["questions"] if not q["used"]]
+    if not dispo:
+        await interaction.response.send_message(
+            "😕 Plus aucune question disponible. Un orga peut en préparer avec `/quiz_preparer`.", ephemeral=True
+        )
+        return
+
+    # Pool des candidats pour construire les choix de réponse
+    pool = {}
+    for role_id in (CANDIDAT_ROLE_ID, ELIMINE_ROLE_ID):
+        role = guild.get_role(role_id)
+        if role:
+            for m in role.members:
+                if not m.bot:
+                    pool[m.id] = m
+    if len(pool) < 4:
+        await interaction.response.send_message("❌ Pas assez de candidats pour jouer.", ephemeral=True)
+        return
+
+    if not await reserver_salon(interaction):
+        return
+
+    tirage = random.sample(dispo, min(questions, len(dispo)))
+    await interaction.response.send_message(
+        f"🧠 **QUIZ DE L'AVENTURE** — {len(tirage)} question(s), {temps}s pour répondre à chaque fois !\n"
+        "Choisis le bon candidat dans le menu. C'est parti... 🔥"
+    )
+
+    channel = interaction.channel
+    scores = {}
+    posees = 0
+
+    try:
+        for numero, q in enumerate(tirage, start=1):
+            bonne = pool.get(q["answer_id"]) or guild.get_member(q["answer_id"])
+            # Question marquée comme posée tout de suite : elle ne reviendra jamais
+            q["used"] = True
+            save_quiz()
+            if not bonne:
+                continue  # le candidat a quitté le serveur : on saute la question
+
+            autres = [m for m in pool.values() if m.id != bonne.id]
+            choix = random.sample(autres, min(9, len(autres))) + [bonne]
+            random.shuffle(choix)
+
+            view = QuiADitView(choix, placeholder="👤 Qui est-ce ?")
+            embed = discord.Embed(
+                title=f"🧠 Question {numero}/{len(tirage)}",
+                description=f"**{q['question']}**\n\n⏳ **{temps} secondes** !",
+                color=discord.Color.blurple()
+            )
+            msg = await channel.send(embed=embed, view=view)
+            await asyncio.sleep(temps)
+
+            view.select.disabled = True
+            try:
+                await msg.edit(view=view)
+            except discord.HTTPException:
+                pass
+
+            bons = [uid for uid, vote in view.votes.items() if vote == bonne.id]
+            for uid in bons:
+                scores[uid] = scores.get(uid, 0) + 1
+
+            gagnants_txt = ", ".join(f"<@{uid}>" for uid in bons) if bons else "*Personne*"
+            description = f"La réponse : **{bonne.display_name}** ({bonne.mention})\n"
+            if q.get("explication"):
+                description += f"💡 {q['explication']}\n"
+            description += f"\n✅ Bonne réponse : {gagnants_txt}"
+            await channel.send(embed=discord.Embed(
+                title="🎯 Réponse",
+                description=description,
+                color=discord.Color.green() if bons else discord.Color.red()
+            ))
+            posees += 1
+            await asyncio.sleep(3)
+    finally:
+        parties_en_cours.discard(channel.id)
+
+    if posees:
+        await channel.send(embed=discord.Embed(
+            title="🏆 Classement final — Quiz de l'aventure",
+            description=format_scores(scores),
+            color=discord.Color.gold()
+        ))
+
+    # Recharge automatique en arrière-plan s'il reste peu de questions
+    if quiz_restantes() < QUIZ_MIN_RESTANTES and GEMINI_API_KEY and not quiz_lock.locked():
+        asyncio.create_task(recharge_silencieuse(guild))
 
 
 bot.run(TOKEN)
