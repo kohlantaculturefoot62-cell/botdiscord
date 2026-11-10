@@ -20,9 +20,12 @@ CATEGORY_REUNIFIE_ID = 1537440948697432064
 
 CANDIDAT_ROLE_ID = 1535332671499280525    # Rôle @candidats
 
-# Rôle @spectateurs : mets son ID ici, ou dans la variable d'environnement SPECTATEUR_ROLE_ID.
-# Si l'ID vaut 0, le bot cherche un rôle dont le nom contient "spectateur".
-SPECTATEUR_ROLE_ID = int(os.getenv("SPECTATEUR_ROLE_ID", 0))
+ELIMINE_ROLE_ID = 1535332789833171087     # Rôle @éliminés (anciens candidats)
+SPECTATEUR_ROLE_ID = 1535332731221967059  # Rôle @spectateurs
+
+# Rôle @orga : mets son ID ici, ou dans la variable d'environnement ORGA_ROLE_ID.
+# Si l'ID vaut 0, le bot cherche un rôle dont le nom contient "orga" (orga, organisateur, organisation...).
+ORGA_ROLE_ID = 1535332585671233676
 
 TEAMS_CONFIG = {
     "Sangaré": {
@@ -525,7 +528,7 @@ async def slash_expulser(interaction: discord.Interaction, membre: discord.Membe
 # /rapidite    : le premier à cliquer sur le bouton gagne
 # /anagramme   : remets les lettres dans l'ordre
 # /duel        : pierre-feuille-machette entre deux joueurs
-# /reset_citations : (admin) remet à zéro les phrases déjà utilisées
+# /reset_citations : (admin/orga) remet à zéro les phrases déjà utilisées
 # ==========================================================
 
 # Salons où une partie est déjà en cours (évite les parties qui se chevauchent)
@@ -676,7 +679,10 @@ def is_valid_quote(msg: discord.Message, candidat_role) -> bool:
     """Une phrase est utilisable si elle vient d'un candidat, est lisible et jamais utilisée."""
     if msg.author.bot or msg.id in used_quotes:
         return False
-    if not isinstance(msg.author, discord.Member) or candidat_role not in msg.author.roles:
+    # L'auteur doit être (ou avoir été) candidat : rôle candidat OU rôle éliminé
+    if not isinstance(msg.author, discord.Member):
+        return False
+    if not any(r.id in (CANDIDAT_ROLE_ID, ELIMINE_ROLE_ID) for r in msg.author.roles):
         return False
     text = msg.content.strip()
     if not (15 <= len(text) <= 250):
@@ -689,13 +695,26 @@ def is_valid_quote(msg: discord.Message, candidat_role) -> bool:
 
 
 def get_spectateur_role(guild):
-    """Retrouve le rôle spectateurs (par ID, sinon par nom)."""
-    if SPECTATEUR_ROLE_ID:
-        return guild.get_role(SPECTATEUR_ROLE_ID)
+    """Retrouve le rôle spectateurs."""
+    return guild.get_role(SPECTATEUR_ROLE_ID)
+
+
+def get_orga_role(guild):
+    """Retrouve le rôle orga (par ID, sinon par nom contenant 'orga')."""
+    if ORGA_ROLE_ID:
+        return guild.get_role(ORGA_ROLE_ID)
     for role in guild.roles:
-        if "spectateur" in normaliser(role.name):
+        if "orga" in normaliser(role.name):
             return role
     return None
+
+
+def is_staff(member) -> bool:
+    """Admin du serveur ou membre du rôle orga : peut tout lancer."""
+    if member.guild_permissions.administrator:
+        return True
+    orga_role = get_orga_role(member.guild)
+    return bool(orga_role and orga_role in member.roles)
 
 
 def quote_channels(guild, candidat_role, only_channel=None, access_role=None):
@@ -749,10 +768,11 @@ async def pick_quote(guild, candidat_role, only_channel=None, access_role=None):
 
 
 class QuiADitView(View):
-    def __init__(self, options_members, voter_role=None):
+    def __init__(self, options_members, voter_role_ids=None):
         super().__init__(timeout=None)
         self.votes = {}
-        self.voter_role = voter_role  # si défini, seuls les membres avec ce rôle peuvent voter
+        # si défini, seuls ces rôles (et les admins/orgas) peuvent voter
+        self.voter_role_ids = voter_role_ids
 
         options = [
             discord.SelectOption(label=m.display_name[:100], value=str(m.id))
@@ -763,11 +783,14 @@ class QuiADitView(View):
         self.add_item(self.select)
 
     async def on_vote(self, interaction: discord.Interaction):
-        if self.voter_role and self.voter_role not in getattr(interaction.user, "roles", []):
-            await interaction.response.send_message(
-                f"⛔ Seuls les membres **{self.voter_role.name}** peuvent voter ici.", ephemeral=True
-            )
-            return
+        if self.voter_role_ids is not None:
+            user = interaction.user
+            autorise = is_staff(user) or any(r.id in self.voter_role_ids for r in user.roles)
+            if not autorise:
+                await interaction.response.send_message(
+                    "⛔ Seuls les spectateurs, les orgas et les admins peuvent voter ici.", ephemeral=True
+                )
+                return
         self.votes[interaction.user.id] = int(interaction.data["values"][0])
         await interaction.response.send_message(
             "🗳️ Vote enregistré ! Tu peux le changer jusqu'à la fin du temps imparti.", ephemeral=True
@@ -791,12 +814,13 @@ async def lancer_qui_a_dit(interaction: discord.Interaction, manches: int, temps
                 ephemeral=True
             )
             return
-        # Réservé aux spectateurs (le contenu des salons secrets ne doit pas fuiter vers les candidats)
-        if spectateur_role not in interaction.user.roles:
-            await interaction.response.send_message("⛔ Ce jeu est réservé aux **spectateurs**.", ephemeral=True)
+        # Réservé aux spectateurs, orgas et admins (le contenu des salons secrets ne doit pas fuiter vers les candidats)
+        staff = is_staff(interaction.user)
+        if not staff and spectateur_role not in interaction.user.roles:
+            await interaction.response.send_message("⛔ Ce jeu est réservé aux **spectateurs**, orgas et admins.", ephemeral=True)
             return
-        # Le jeu ne doit pas se lancer dans un salon lisible par les candidats
-        if interaction.channel.permissions_for(candidat_role).read_messages:
+        # Le jeu ne doit pas se lancer dans un salon lisible par les candidats (sauf pour les orgas/admins)
+        if not staff and interaction.channel.permissions_for(candidat_role).read_messages:
             await interaction.response.send_message(
                 "⛔ Lance ce jeu dans un salon que les candidats ne peuvent pas voir (salon des spectateurs).",
                 ephemeral=True
@@ -811,7 +835,12 @@ async def lancer_qui_a_dit(interaction: discord.Interaction, manches: int, temps
             await interaction.response.send_message("⛔ Ce salon ne peut pas être utilisé pour ce jeu.", ephemeral=True)
             return
 
-    candidats = [m for m in candidat_role.members if not m.bot]
+    # Joueurs proposés comme réponses : candidats + éliminés (anciens candidats)
+    elimine_role = guild.get_role(ELIMINE_ROLE_ID)
+    candidats = {m.id: m for m in candidat_role.members if not m.bot}
+    if elimine_role:
+        candidats.update({m.id: m for m in elimine_role.members if not m.bot})
+    candidats = list(candidats.values())
     if len(candidats) < 4:
         await interaction.response.send_message("❌ Pas assez de candidats pour jouer.", ephemeral=True)
         return
@@ -844,7 +873,7 @@ async def lancer_qui_a_dit(interaction: discord.Interaction, manches: int, temps
             choix = random.sample(autres, min(9, len(autres))) + [auteur]
             random.shuffle(choix)
 
-            view = QuiADitView(choix, voter_role=spectateur_role)
+            view = QuiADitView(choix, voter_role_ids={spectateur_role.id} if spectateur_role else None)
             embed = discord.Embed(
                 title=f"🕵️ Manche {numero}/{manches} — Qui a dit ça ?",
                 description=f"> {discord.utils.escape_mentions(quote.content.strip())}\n\n⏳ **{temps} secondes** pour voter !",
@@ -918,8 +947,10 @@ async def slash_qui_a_dit_spectateurs(
 
 
 @bot.tree.command(name="reset_citations", description="Remet à zéro la liste des phrases déjà utilisées dans /qui_a_dit")
-@app_commands.default_permissions(administrator=True)
 async def slash_reset_citations(interaction: discord.Interaction):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Réservé aux admins et aux orgas.", ephemeral=True)
+        return
     used_quotes.clear()
     save_used_quotes(used_quotes)
     await interaction.response.send_message("♻️ Les phrases pourront de nouveau être tirées.", ephemeral=True)
